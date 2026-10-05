@@ -1,0 +1,37 @@
+{
+  "name": "diplomatic_markdown_transcription",
+  "schema_version": "1.0",
+  "type": "json_schema",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "image_analysis": {
+        "type": "string",
+        "description": "Brief description of the page: layout (columns, marginalia, tables), typeface or hand, language(s), position of page numbers, catchwords, signature marks and footnotes, and any damage or legibility problems."
+      },
+      "transcription": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "- Task: Return a diplomatic, markdown-formatted, verbatim transcription of the page.\n- Scope: Transcribe all visible text and structural elements (running heads, headings, body text, marginalia, footnotes, catchwords, signature marks, tables, captions) unless the context or instructions exclude them.\n- Diplomatic fidelity: Keep spelling, capitalization, punctuation, abbreviations, contractions, ligature letters, long s (ſ), u/v and i/j usage, superscript letters and special characters exactly as printed or written. Do not modernize, normalize, expand abbreviations or correct apparent errors.\n- Line breaks: Preserve every line break of the original. Keep line-end hyphens and split words exactly as shown.\n- Markdown structure: Use `#`/`##` for headings, `*italic*` and `**bold**` where the typography marks them, and markdown tables for tabular matter.\n- Page numbers: Write printed page or folio numbers from running heads or footers like `<page_number>9</page_number>`.\n- Footnotes: Write footnote references as `[^1]` in the text and the notes as `[^1]: Note text`.\n- Images and ornaments: Mark illustrations, initials, ornaments and diagrams as `![Image: short description]`.\n- Uncertainty: Wrap doubtful readings in `<unclear>...</unclear>` with your best reading inside. Mark illegible or lost text with `<gap/>`. Never guess silently.\n- Multi-column text: Transcribe column by column, keeping the line breaks within each column.\n- Cross-page continuity: Words and sentences continuing from the previous page or onto the next page are transcribed exactly as they appear on this page.\n- Empty pages: If the page carries no transcribable text, return null and set no_transcribable_text to true.\n- No fabrication: Transcribe only what is visible. Do not complete, summarize or translate text."
+      },
+      "no_transcribable_text": {
+        "type": "boolean",
+        "description": "True if the page contains no transcribable text (blank page, pure illustration); otherwise false."
+      },
+      "transcription_not_possible": {
+        "type": "boolean",
+        "description": "True if and only if transcription is entirely impossible (e.g. the page is illegible throughout); otherwise false."
+      }
+    },
+    "required": [
+      "image_analysis",
+      "transcription",
+      "no_transcribable_text",
+      "transcription_not_possible"
+    ],
+    "additionalProperties": false
+  }
+}
