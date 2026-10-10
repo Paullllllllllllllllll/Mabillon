@@ -1,6 +1,6 @@
 {
 	"name": "mabillon",
-	"version": "0.7.1",
+	"version": "0.7.2",
 	"description": "Agentic transcription and schema-validated structured extraction for historical sources, built on the pi agent harness.",
 	"type": "module",
 	"license": "MIT",

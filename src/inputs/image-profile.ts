@@ -219,7 +219,28 @@ function openWeightProfile(family: OpenWeightFamily, quality: Exclude<ImageQuali
 	return quality === "high" ? high : { ...build(family.max), lower: { ...high, label: `${high.label} (fallback)` } };
 }
 
+/**
+ * OpenRouter rejects Kimi requests whose images exceed 30 MB (413 "Downloaded image content cannot exceed 30MB");
+ * Kimi through OpenRouter keeps at most 28 MB of images per request.
+ */
+const OPENROUTER_KIMI_REQUEST_IMAGE_BYTES = 28 * MB;
+
+function capRequestImageBytes(profile: ImageProfile, cap: number): ImageProfile {
+	return {
+		...profile,
+		maxRequestImageBytes: Math.min(profile.maxRequestImageBytes, cap),
+		...(profile.lower ? { lower: capRequestImageBytes(profile.lower, cap) } : {}),
+	};
+}
+
 export function resolveImageProfile(model: ModelIdentity | undefined, quality: ImageQuality): ImageProfile {
+	const profile = familyProfile(model, quality);
+	return model?.provider === "openrouter" && model.id.startsWith("moonshotai/kimi-")
+		? capRequestImageBytes(profile, OPENROUTER_KIMI_REQUEST_IMAGE_BYTES)
+		: profile;
+}
+
+function familyProfile(model: ModelIdentity | undefined, quality: ImageQuality): ImageProfile {
 	if (!model || quality === "standard") return STANDARD;
 	const id = bareId(model.id);
 
