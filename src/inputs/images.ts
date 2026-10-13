@@ -34,7 +34,7 @@ export interface ImageLimits {
 
 export interface ViewOptions {
 	box?: Box;
-	/** Extra magnification for a region (0.25-4). Default: small regions are enlarged up to 3x. */
+	/** Extra magnification for a region (0.25-8). Default: small regions are enlarged up to 3x. */
 	scale?: number;
 	/** Clockwise rotation in degrees, applied after cropping. */
 	rotate?: number;
@@ -258,7 +258,7 @@ export async function prepareImage(
 	let factor = fitFactor(
 		image.width,
 		image.height,
-		Math.min(Math.max(wanted, 0.05), 4),
+		Math.min(Math.max(wanted, 0.05), 8),
 		options.limits,
 		options.rotate,
 	);

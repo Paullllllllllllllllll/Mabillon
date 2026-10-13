@@ -40,6 +40,8 @@ Usage:
 Model:
   --model <provider/id>        e.g. openai/gpt-6-luna, anthropic/claude-opus-4-8
   --thinking <level>           off | minimal | low | medium | high | xhigh | max
+  --service-tier <tier>        OpenAI service tier: flex | priority | auto | default (OpenAI API key only;
+                               flex costs half and is slower)
 
 Work organization:
   --units-per-session <n>      pages/chunks per agent session (default 20)
@@ -74,8 +76,14 @@ Output and runs:
   --force                      discard existing work for the documents and start over
   --redo-review                re-run units that were closed for review
   --tools <list>               the agent's tools, comma-separated (default read,write,edit,view,verify,
-                               add_entries,update_entry; also bash; tools that do not apply are left out)
+                               add_entries,update_entry; also bash, python; tools that do not apply are left out)
   --bash                       add bash (a shell, not sandboxed) to the tools; --no-bash removes it
+  --python                     add python (image units: scripts on the page images) to the tools; --no-python
+                               removes it
+  --python-path <path>         Python interpreter for the python tool (default python; needs numpy and Pillow)
+  --python-timeout <seconds>   time limit of one python call (default 120)
+  --no-python-sandbox          run python scripts unsandboxed, with your user's permissions (default: in the
+                               OS sandbox, without network, writing only to scratch/)
   --no-image-fallback          fail a document instead of lowering image fidelity when the provider rejects it
   --allow-partial-ranges       accept line-range files that leave source lines uncovered
   --keep-session-images        keep page images in the saved session logs (large)
@@ -119,6 +127,8 @@ const BOOLEAN_FLAGS = new Set([
 	"redoReview",
 	"verbose",
 	"bash",
+	"python",
+	"pythonSandbox",
 	"autoContext",
 	"keepSessionImages",
 	"imageFallback",

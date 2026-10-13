@@ -1,4 +1,4 @@
-# Mabillon v0.7.2
+# Mabillon v0.9.0
 
 Mabillon is an agent for transcribing historical sources and extracting
 schema-validated structured data from them. It is named after Jean Mabillon
@@ -82,6 +82,25 @@ upstream providers that answered (`served_by`) in `session_settings` of the run
 metadata. These settings apply only to models reached through OpenRouter; the data
 policies of other providers (OpenAI, Anthropic, the ChatGPT login) are those of your
 account with them.
+
+### OpenAI service tiers
+
+`--service-tier flex` (`service_tier: flex`) sends OpenAI's `service_tier` field
+with every request; `priority`, `auto` and `default` are accepted as well. Flex
+processing costs half the standard token price, and pi's cost accounting applies
+the discount. It is slower, and when OpenAI lacks capacity it answers with HTTP 429
+"Resource Unavailable" (not billed). Under `flex`, Mabillon therefore retries
+transient errors after 1, 2, 5, 10 and 15 minutes and raises pi's request timeout
+to 15 minutes. OpenAI rejects models that do not offer the tier.
+
+Tiers apply only to OpenAI models used with an API key (`openai/<model>` with
+`OPENAI_API_KEY` or an API key stored in pi). The ChatGPT login is also provider
+`openai`, but it bills against the subscription and takes no tier; OpenRouter and
+the legacy `openai-codex` provider take none either. A run with a tier and any such
+model, or without `--model`, stops before touching a document (exit code 2). A
+ChatGPT login stored in pi takes precedence over `OPENAI_API_KEY`. Each session
+records the requested tier as `service_tier` in `session_settings`. In `mabillon
+tui`, the tier from `mabillon.yaml` is sent only for OpenAI API-key requests.
 
 ## Usage
 
@@ -174,9 +193,12 @@ Mabillon's own:
 
 - `read`, `write`, `edit`, `bash` (pi built-ins; `bash` only with `--bash`),
 - `view` (image modes): the current, previous, or next page, whole or as a zoomed
-  region (`box` in page fractions), with optional contrast, threshold, sharpen
+  region (`box` in page fractions), or up to four regions in one call (`boxes`, one
+  image each), magnified up to 8x, with optional contrast, threshold, sharpen
   (enhancements are applied in the order given), rotation, and a labelled
-  coordinate grid,
+  coordinate grid. A `boxes` call that would not fit into one request next to the
+  context images and the unit's page is refused with the number of regions that fit,
+  so no region is dropped unseen,
 - `add_entries` (extraction with an `entries` array): changes the current unit
   file without resending or reading it, creating it with the schema's envelope if
   needed. `remove` deletes entries by number, `entries` adds new ones (at the end,
@@ -196,7 +218,22 @@ Mabillon's own:
   to a value. The changed entry must still match the schema's entry structure,
   otherwise nothing changes; for text units the result reports the grounding of
   the changed entry and the chunk coverage,
-- `verify`: validates the current unit file; with `final=true` it commits the unit.
+- `verify`: validates the current unit file; with `final=true` it commits the unit,
+- `python` (image units, opt-in with `--python`): runs a Python script the agent writes,
+  with the work folder as current folder. The current, previous and next page are
+  written as lossless PNGs at full resolution to `source/<id>.png` (paths in
+  `source/pages.json` and the variables `MABILLON_PAGE`, `MABILLON_PREVIOUS_PAGE`,
+  `MABILLON_NEXT_PAGE`). `scratch/pagetools.py`, copied from `python/pagetools.py` at
+  the first session, has helpers for crops, magnification, background removal,
+  binarization (Otsu, Sauvola), deskewing, line and column detection from projection
+  profiles, captioned line strips and side-by-side comparisons of letter forms; the
+  agent may change and extend it, and its version stays for later units. Images the
+  script saves to `scratch/show/` (emptied before each call) are returned, at most four
+  per call, prepared like `view` images but never enlarged; stdout and stderr are
+  returned as well (the last 6,000 characters each). A call stops after
+  `python_timeout` seconds (default 120). The interpreter is `python_path` (default
+  `python`) and needs numpy and Pillow; OpenCV is used when installed. No environment
+  variable of yours reaches the script.
 
 `--tools read,write,verify` (or `tools:` in `mabillon.yaml`) sets the exact tool
 set, for example for ablations. The default is `read`, `write`, `edit`, `view`,
@@ -204,7 +241,8 @@ set, for example for ablations. The default is `read`, `write`, `edit`, `view`,
 (`view` outside image units, `add_entries` and `update_entry` outside extraction).
 `verify`, `view` (image units) and `read` (text units) cannot be left out, and the
 set needs a tool that creates the unit file (`write`; in extraction also
-`add_entries`; `bash` is only an add-on, since the soft cap takes it away); other
+`add_entries`; `bash` and `python` are only add-ons, since the soft cap takes them
+away); other
 sets and unknown names are refused (exit code 2). Hints of pi's own tools that
 point to a disabled tool (read's "Use bash: sed ..." for an overlong line) are
 rewritten. `--bash` adds
@@ -212,6 +250,31 @@ rewritten. `--bash` adds
 messages mention only the tools the agent has, and the effective set is recorded
 per session in the state, as `tools` in the run metadata of the outputs, and per
 document in the `--json` result.
+
+`python` scripts run in an OS sandbox by default
+([sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.79,
+adapted from pi's example sandbox extension): no network, writes only under
+`scratch/`, reads only the work folder and the interpreter's own folders (on macOS and
+Linux everything outside the home folder stays readable). Before the first document,
+a probe checks in the sandbox that the interpreter imports numpy and Pillow, that it
+can write to `scratch/` and nowhere else, and that a network connection fails; if
+the sandbox is missing or leaks, the run stops with exit code 2. On Windows the
+sandbox needs a one-time setup with administrator rights:
+
+```powershell
+npx @anthropic-ai/sandbox-runtime@0.0.79 windows-install
+```
+
+It creates a local account `srt-sandbox`, under which the scripts run, and a Windows
+Filtering Platform rule that blocks that account's outbound connections
+(`windows-uninstall` removes both). The grants are permissions for that account on the
+work folder and the interpreter, added while a run uses them. Limits: DNS lookups still
+go through the system resolver, folders that every local user may read stay readable,
+and two Mabillon processes running python at the same time share the account and thus
+each other's grants. `--no-python-sandbox` (`python_sandbox: false`) runs the scripts
+unsandboxed with your user's permissions. Mabillon itself never follows a link or
+junction the script puts into `scratch/` when it writes the script, clears or reads
+`scratch/show/`.
 
 `read`, `write`, and `edit` are confined to the agent's work folder. `bash` is not
 sandboxed: it runs with your user's permissions. Mabillon keeps its canonical
@@ -227,6 +290,17 @@ the run stops before touching any document (exit code 2). Every bash command run
 unit file that is not valid UTF-8 fails `verify` with an error.
 
 ### Unit protocol and its enforcement
+
+The system prompt's method has the agent check its draft against the page
+systematically: with `view` (or `python`), it goes through the whole page in
+overlapping bands, magnified only as far as needed to make every character
+unambiguous, and corrects the draft band by band (extraction: compares the entries of
+each band field by field and adds missing ones). The prompt ends with the completion
+condition shared by the prompting guides of the Claude 5.5, GPT-6, Qwen and Kimi
+models: a unit is done when its file covers the page, every reading is checked and
+`verify` reports no errors; until then the agent keeps working instead of ending its
+turn with a summary or question, runs `verify` after its last change, and marks what
+the source cannot settle instead of guessing.
 
 The system prompt tells the agent to finish one unit before anything else, and the
 harness enforces it:
@@ -247,7 +321,8 @@ harness enforces it:
 Safeguards on the document level: three consecutive units closed for review stop the
 document with an error (check the model, schema, and context, then rerun with
 `--redo-review`). Transient provider errors (rate limits, overload, network) are
-retried with increasing waits of 15 s to 2 min, on top of pi's own retries, and the
+retried with increasing waits of 15 s to 2 min (1 to 15 min under `--service-tier
+flex`), on top of pi's own retries, and the
 count starts afresh whenever a session makes progress. Rejected credentials and
 exhausted quotas or subscription usage limits stop the whole run (per-minute quotas
 that ask for a short wait count as transient).
@@ -422,8 +497,9 @@ It records the run so that experiment arms are self-describing: `implementation`
 (package version, and the git commit and uncommitted changes of a checkout),
 `experiment` (tool set, resolved settings, context file hashes, boundary policy,
 system-prompt hash), `session_settings` (model, thinking, tools and image profile
-per session, and for OpenRouter the routing preferences and the upstream providers
-that served the session), `image_fallbacks`, `uncovered_lines`, and the units shaped
+per session, for OpenRouter the routing preferences and the upstream providers
+that served the session, and the OpenAI service tier where one was requested),
+`image_fallbacks`, `uncovered_lines`, and the units shaped
 by the tool budget (`units_closed_by_hard_cap`, `units_with_soft_cap_blocks`; per unit
 `hard_cap_closed`, `soft_cap_blocks` and the committing `session`). Each page
 (transcription) or provenance unit record lists its remaining verification issues
@@ -554,9 +630,10 @@ The end-to-end tests drive the real pi agent loop with a scripted model and cove
 the unit gate, tool budgets, nudges, compaction, session handoff, PDF rendering,
 provider errors, resume checks, and extraction with grounding and carry-over.
 
-## Changelog
+## Versioning
 
-Release notes are in [CHANGELOG.md](CHANGELOG.md).
+Mabillon follows semantic versioning; release notes are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

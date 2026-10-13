@@ -23,7 +23,7 @@ export interface RunMetadata {
 	implementation: { version: string; commit?: string; dirty?: boolean };
 	/** The experiment arm: tools, resolved settings, context file hashes, boundary policy, system-prompt hash. */
 	experiment?: DocState["experiment"];
-	/** Per session: model, thinking, tools and image profile. */
+	/** Per session: model, thinking, tools, image profile, and routing or service tier where set. */
 	session_settings: Array<{
 		session: number;
 		model?: string;
@@ -32,6 +32,8 @@ export interface RunMetadata {
 		image_profile?: string;
 		/** OpenRouter provider preferences sent with the session's requests. */
 		routing?: Record<string, unknown>;
+		/** OpenAI service tier requested for the session's requests. */
+		service_tier?: string;
 		/** Upstream providers that served the session's requests (OpenRouter). */
 		served_by?: string[];
 	}>;
@@ -92,6 +94,7 @@ function buildMetadata(state: DocState, schema: LoadedSchema, selected: (index: 
 			tools: session.tools,
 			image_profile: session.imageProfile,
 			...(session.routing ? { routing: session.routing } : {}),
+			...(session.serviceTier ? { service_tier: session.serviceTier } : {}),
 			...(session.servedBy?.length ? { served_by: session.servedBy } : {}),
 		})),
 		...(state.imageFallbacks?.length ? { image_fallbacks: state.imageFallbacks } : {}),

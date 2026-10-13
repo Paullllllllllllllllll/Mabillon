@@ -1,5 +1,33 @@
 # Changelog
 
+- **v0.9.0** (13 October 2026) -- `view` takes `boxes`, up to four page regions in
+  one call with one image each, and magnifies up to 8x; a batch that would not fit
+  into one request next to the context images and the unit's page is refused with
+  the number of regions that fit instead of losing regions unseen. The method steps
+  of transcription and extraction now have the agent check its draft against the page
+  systematically, in overlapping bands magnified only as far as needed, and the
+  system prompt ends with a completion section that follows what the prompting guides
+  of the Claude 5.5, GPT-6, Qwen and Kimi models share (an explicit completion
+  condition, persistence until it holds, one check after the last change, marking
+  what cannot be read); both change the system prompt of every arm. New opt-in tool
+  `python` (`--python`, image units): scripts on lossless page images with a helper
+  module (`python/pagetools.py`), images saved to `scratch/show/` returned to the
+  model, no user environment variables passed on, and `python` may replace `view`
+  in `--tools`. The scripts run in an OS sandbox adapted from pi's sandbox example on
+  `@anthropic-ai/sandbox-runtime` 0.0.79 (new dependency): no network, writes only to
+  `scratch/`, probed before the first document, failing closed with exit code 2;
+  `--no-python-sandbox` runs them unsandboxed. Mabillon refuses links and junctions
+  in `scratch/` instead of following them. New settings `python`, `python_path`,
+  `python_timeout` and `python_sandbox`.
+- **v0.8.0** (12 October 2026) -- Adds `--service-tier` (`service_tier`) for
+  OpenAI's service tiers (`flex`, `priority`, `auto`, `default`). The tier is sent
+  as `service_tier` with every request of OpenAI models used with an API key and
+  recorded per session (`session_settings.service_tier`); a run with any other
+  model or route, including OpenRouter and the ChatGPT login, stops at the start
+  with exit code 2. Under `flex`, which OpenAI bills at half the standard price and
+  pi costs accordingly, transient errors such as the 429 "Resource Unavailable"
+  replies are retried after 1, 2, 5, 10 and 15 minutes, and pi's request timeout
+  is raised to 15 minutes.
 - **v0.7.2** (10 October 2026) -- Kimi models reached through OpenRouter keep at
   most 28 MB of images per request. OpenRouter rejects Kimi requests whose images
   exceed 30 MB (HTTP 413 "Downloaded image content cannot exceed 30MB"), which the

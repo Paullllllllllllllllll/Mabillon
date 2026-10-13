@@ -141,6 +141,7 @@ export async function unitContent(
 	if (runtime.inputKind === "images") {
 		const { key, loader } = runtime.sources.image(unit);
 		const image = await prepareImage(key, loader, { limits: runtime.imageProfile });
+		runtime.pageImageBytes = image.data.length;
 		content.push({
 			type: "text",
 			text: `${describePrepared(`Page ${unit.id}`, image, runtime.tools.has("view"))} This is the full page${runtime.tools.has("view") ? "; use view with box to zoom in" : ""}.`,

@@ -1,6 +1,6 @@
 {
 	"name": "mabillon",
-	"version": "0.7.2",
+	"version": "0.9.0",
 	"description": "Agentic transcription and schema-validated structured extraction for historical sources, built on the pi agent harness.",
 	"type": "module",
 	"license": "MIT",
@@ -11,6 +11,7 @@
 	"files": [
 		"dist",
 		"schemas",
+		"python",
 		"README.md",
 		"LICENSE"
 	],
@@ -25,6 +26,7 @@
 		"format": "biome check --write ."
 	},
 	"dependencies": {
+		"@anthropic-ai/sandbox-runtime": "0.0.79",
 		"@earendil-works/pi-ai": "1.0.0",
 		"@earendil-works/pi-coding-agent": "1.0.0",
 		"@napi-rs/canvas": "1.0.10",

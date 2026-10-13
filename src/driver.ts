@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative } from "node:path";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import {
@@ -17,7 +18,9 @@ import { createChronoExtension, type FinishedUnit } from "./agent/extension.ts";
 import type { MessageContent } from "./agent/messages.ts";
 import { sessionIntro } from "./agent/messages.ts";
 import { buildSystemPrompt } from "./agent/prompts.ts";
+import { bundledHelperSha256, localPythonRunner, type PythonRunner, pythonEnvironment } from "./agent/python-tool.ts";
 import { readCommitted, type SessionRuntime, type UnitSources } from "./agent/runtime.ts";
+import { checkSandbox, resetSandbox, sandboxedPythonRunner } from "./agent/sandbox.ts";
 import {
 	acquireLock,
 	type DocPaths,
@@ -49,6 +52,13 @@ import { type OutputPaths, writeOutputs } from "./outputs.ts";
 import { describePreferences, effectiveRouting, openRouterPreferences, withOpenRouterRouting } from "./routing.ts";
 import { boundaryPolicy, envelopeInfo, type LoadedSchema, resolveSchema } from "./schemas/registry.ts";
 import {
+	checkServiceTierRoute,
+	FLEX_TIMEOUT_MS,
+	isOpenAIResponses,
+	retryDelaysFor,
+	withServiceTier,
+} from "./service-tier.ts";
+import {
 	ensureDir,
 	errorMessage,
 	formatUnitId,
@@ -68,6 +78,8 @@ export interface RunServices {
 	retryDelays?: number[];
 	/** Shell lookup for the bash tool (tests inject a missing shell). Default: findBashShell. */
 	findShell?: (configured: string | undefined) => { available: boolean; path?: string };
+	/** Runner for the python tool's scripts (tests inject a fake). Default: the local interpreter. */
+	pythonRunner?: PythonRunner;
 }
 
 const NO_SHELL_MESSAGE =
@@ -611,6 +623,81 @@ function bashOnPath(): boolean {
 	return bashOnPathCache;
 }
 
+const PYTHON_PROBE = "import json, sys, numpy, PIL; print(json.dumps([sys.executable, sys.prefix, sys.base_prefix]))";
+
+/**
+ * Stops the run (exit code 2) unless the python tool's interpreter starts and imports numpy and Pillow. Returns the
+ * interpreter's absolute path and the folders it reads from (sys.prefix and sys.base_prefix).
+ */
+async function checkPython(
+	config: ChronoConfig,
+	runner: PythonRunner,
+): Promise<{ executable: string; dirs: string[] }> {
+	const fail = (detail: string) =>
+		new Error(
+			`The python tool was requested (--python or in --tools), but ${detail}. Set python_path (--python-path) to an interpreter with numpy and Pillow, or leave python out.`,
+		);
+	let run: Awaited<ReturnType<PythonRunner>>;
+	try {
+		run = await runner({
+			python: config.pythonPath,
+			args: ["-c", PYTHON_PROBE],
+			cwd: tmpdir(),
+			env: pythonEnvironment(tmpdir(), { current: "" }),
+			timeoutMs: 60_000,
+		});
+	} catch (error) {
+		throw fail(`${config.pythonPath} could not be started (${errorMessage(error)})`);
+	}
+	const line = run.stdout.trim().split(/\r?\n/).pop() ?? "";
+	let paths: unknown;
+	try {
+		paths = JSON.parse(line);
+	} catch {
+		paths = undefined;
+	}
+	if (run.exitCode !== 0 || !Array.isArray(paths) || paths.some((path) => typeof path !== "string")) {
+		throw fail(
+			`${config.pythonPath} cannot import numpy and Pillow (${(run.stderr || run.stdout).trim().slice(-300)})`,
+		);
+	}
+	const [executable, ...dirs] = paths as string[];
+	return { executable, dirs: [...new Set(dirs)] };
+}
+
+/**
+ * The interpreter and runner of the python tool for this run. By default the interpreter runs in the sandbox, which
+ * is probed first; without one the run stops (exit code 2) unless python_sandbox is false. Tests inject a runner.
+ */
+async function preparePython(
+	config: ChronoConfig,
+	injected: PythonRunner | undefined,
+	log: (message: string) => void,
+): Promise<{ python: string; runner: PythonRunner }> {
+	if (injected) {
+		await checkPython(config, injected);
+		return { python: config.pythonPath, runner: injected };
+	}
+	const { executable, dirs } = await checkPython(config, localPythonRunner);
+	if (!config.pythonSandbox) {
+		log(`python: ${executable}, not sandboxed (python_sandbox: false); scripts run with your user's permissions`);
+		return { python: executable, runner: localPythonRunner };
+	}
+	try {
+		await checkSandbox(executable, dirs);
+	} catch (error) {
+		const setup =
+			process.platform === "win32"
+				? "On Windows, set the sandbox up once with `npx @anthropic-ai/sandbox-runtime@0.0.79 windows-install` (one UAC prompt)"
+				: "See the sandbox requirements in the README (bubblewrap and socat on Linux)";
+		throw new Error(
+			`The python tool runs in a sandbox, which is not available: ${errorMessage(error)}. ${setup}, or pass --no-python-sandbox to run scripts unsandboxed with your user's permissions.`,
+		);
+	}
+	log(`python: ${executable}, sandboxed (no network; writes only to scratch/)`);
+	return { python: executable, runner: sandboxedPythonRunner(dirs) };
+}
+
 interface SessionOutcome {
 	finished: FinishedUnit[];
 	error?: string;
@@ -634,6 +721,11 @@ async function runSession(ctx: DocumentContext, batch: UnitRecord[]): Promise<Se
 		: SettingsManager.create(paths.workDir, ctx.agentDir);
 	// Mabillon sizes every image for the model itself, so pi must not shrink them to its 2,000 px default.
 	settingsManager.applyOverrides({ compaction: { enabled: true }, images: { autoResize: false } });
+	// Flex requests can wait for capacity; pi's request timeout (its 5-minute HTTP idle timeout unless
+	// retry.provider.timeoutMs is set) is raised to the 15 minutes OpenAI suggests.
+	if (config.serviceTier === "flex" && (settingsManager.getProviderRetrySettings().timeoutMs ?? 0) < FLEX_TIMEOUT_MS) {
+		settingsManager.applyOverrides({ retry: { provider: { timeoutMs: FLEX_TIMEOUT_MS } } });
+	}
 	let entries = false;
 	if (options.mode === "extract") {
 		const { setup, error } = resolveAddEntries(schema);
@@ -672,6 +764,7 @@ async function runSession(ctx: DocumentContext, batch: UnitRecord[]): Promise<Se
 		contextImages: [],
 		imageProfile: resolveImageProfile(undefined, "standard"),
 		sources: ctx.sources,
+		pythonRunner: options.services?.pythonRunner,
 		reviewStreak: ctx.reviewStreak,
 		persist: ctx.persist,
 		log,
@@ -724,9 +817,12 @@ async function runSession(ctx: DocumentContext, batch: UnitRecord[]): Promise<Se
 	runtime.reserveTokens = settingsManager.getCompactionSettings(session.model).reserveTokens;
 	const modelKey = `${session.model.provider}/${session.model.id}`;
 	const routing = openRouterPreferences(config, session.model);
-	// The routing travels with the model, so requests that bypass before_provider_request carry it too.
 	const sentRouting = effectiveRouting(session.model, routing);
-	session.agent.state.model = withOpenRouterRouting(session.model, routing);
+	// The run checked at its start that a model with a service tier is an OpenAI model used with an API key.
+	const serviceTier = isOpenAIResponses(session.model) ? config.serviceTier : undefined;
+	// The routing and the service tier travel with the model, so requests that bypass before_provider_request
+	// (pi's compaction summaries) carry them too.
+	session.agent.state.model = withServiceTier(withOpenRouterRouting(session.model, routing), serviceTier);
 	let profile = ctx.profiles.get(modelKey);
 	if (!profile) {
 		profile = withMaxEdge(resolveImageProfile(session.model, config.imageQuality), config.maxImagePx);
@@ -736,6 +832,7 @@ async function runSession(ctx: DocumentContext, batch: UnitRecord[]): Promise<Se
 	}
 	runtime.imageProfile = profile;
 	runtime.routing = routing;
+	runtime.serviceTier = serviceTier;
 	runtime.servedBy = new Set();
 	runtime.contextImages = await prepareContextImages(ctx.context.images, profile);
 
@@ -747,11 +844,12 @@ async function runSession(ctx: DocumentContext, batch: UnitRecord[]): Promise<Se
 		tools: toolList,
 		imageProfile: profile.label,
 		...(sentRouting && Object.keys(sentRouting).length > 0 ? { routing: sentRouting } : {}),
+		...(runtime.serviceTier ? { serviceTier: runtime.serviceTier } : {}),
 	};
 	state.sessions.push(record);
 	ctx.persist();
 	log(
-		`${state.stem}: session ${state.sessions.length} with ${modelKey}${record.thinking ? ` (${record.thinking})` : ""}: ${batch[0].id}-${batch[batch.length - 1].id}`,
+		`${state.stem}: session ${state.sessions.length} with ${modelKey}${record.thinking ? ` (${record.thinking})` : ""}${record.serviceTier ? `, service tier ${record.serviceTier}` : ""}: ${batch[0].id}-${batch[batch.length - 1].id}`,
 	);
 
 	const unsubscribe = session.subscribe((event) => {
@@ -891,6 +989,14 @@ function experimentRecord(
 		...(doc.kind === "pdf" ? { dpi: config.dpi, maxRenderPixels: config.maxRenderPixels } : {}),
 		...(inputKind === "text"
 			? { chunkTokens: config.chunkTokens, allowPartialRanges: config.allowPartialRanges }
+			: {}),
+		// The helper module the agent starts from is part of the arm; the interpreter is not (recorded per session).
+		...(tools.includes("python")
+			? {
+					pythonTimeout: config.pythonTimeout,
+					pythonSandbox: config.pythonSandbox,
+					pythonHelperSha256: bundledHelperSha256(),
+				}
 			: {}),
 	};
 	const systemPrompt = buildSystemPrompt({
@@ -1128,7 +1234,7 @@ async function processDocument(
 			persist,
 		};
 
-		const retryDelays = options.services?.retryDelays ?? DEFAULT_RETRY_DELAYS;
+		const retryDelays = options.services?.retryDelays ?? retryDelaysFor(config.serviceTier, DEFAULT_RETRY_DELAYS);
 		let stalled = 0;
 		let transientFailures = 0;
 		let reviewStreak = 0;
@@ -1283,6 +1389,11 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 	}
 	log(`schema ${schema.name}${schema.bundled ? " (bundled)" : ""}; ${documents.length} document(s)`);
 	const { modelRuntime, model, agentDir } = await resolveModel(config, options.services);
+	// A service tier is refused for models it cannot reach, rather than silently not sent.
+	if (config.serviceTier) {
+		const auth = model ? await modelRuntime.checkAuth(model.provider) : undefined;
+		checkServiceTierRoute(config.serviceTier, model, auth?.type);
+	}
 	// A requested bash must exist before any document is touched, so the recorded tool set is the one used.
 	const bashWanted = [...new Set(documents.map((doc): InputKind => (doc.kind === "text" ? "text" : "images")))].some(
 		(inputKind) => effectiveTools(config, { mode, inputKind, entries }).includes("bash"),
@@ -1294,6 +1405,21 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 		const shell = (options.services?.findShell ?? findBashShell)(settings.getShellPath());
 		if (!shell.available) throw new Error(NO_SHELL_MESSAGE);
 	}
+	// Likewise a requested python: the interpreter must import numpy and Pillow, and the sandbox must hold.
+	let runOptions = options;
+	if (
+		documents.some(
+			(doc) =>
+				doc.kind !== "text" && effectiveTools(config, { mode, inputKind: "images", entries }).includes("python"),
+		)
+	) {
+		const { python, runner } = await preparePython(config, options.services?.pythonRunner, log);
+		runOptions = {
+			...options,
+			config: { ...config, pythonPath: python },
+			services: { ...options.services, pythonRunner: runner },
+		};
+	}
 	const notices = new Set<string>();
 
 	const results: DocumentResult[] = new Array(documents.length);
@@ -1304,7 +1430,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 			const index = next++;
 			const doc = documents[index];
 			log(`${doc.stem}: ${doc.path}`);
-			const result = await processDocument(doc, options, schema, modelRuntime, model, agentDir, notices);
+			const result = await processDocument(doc, runOptions, schema, modelRuntime, model, agentDir, notices);
 			results[index] = result;
 			if (result.fatal) fatalError ??= result.error;
 			if (result.error) log(`${doc.stem}: FAILED: ${result.error}`);
@@ -1316,7 +1442,12 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 			}
 		}
 	};
-	await Promise.all(Array.from({ length: Math.min(config.concurrency, documents.length) }, () => worker()));
+	try {
+		await Promise.all(Array.from({ length: Math.min(config.concurrency, documents.length) }, () => worker()));
+	} finally {
+		// The sandbox's grants and proxies end with the run.
+		await resetSandbox();
+	}
 	// Documents a fatal error or an interruption kept from starting are reported, not dropped.
 	const notStarted = documents
 		.filter((_, index) => results[index] === undefined)

@@ -52,7 +52,26 @@ function workflowSection(options: PromptOptions, unitWord: string): string {
 			? "\n- Keep notes.md short and current: abbreviations and how you render them, letter forms, recurring names and terms, running heads, layout habits, conventions you settled on. It is shown to you after every compaction and at the start of later sessions."
 			: ""
 	}
-- Work autonomously; there is no user to answer questions. When the session's last unit is committed, stop.`;
+- Work autonomously; there is no user to answer questions.`;
+}
+
+/**
+ * When a unit is done, and when to stop: the guidance the prompting guides of all benchmarked model families share
+ * (an explicit completion condition, persistence until it holds, one check after the last change, honest marking of
+ * what cannot be read). Placed at the end of the prompt, as Anthropic's Opus 5.5 guide recommends.
+ */
+function completionSection(options: PromptOptions, unitWord: string): string {
+	const source = options.inputKind === "images" ? "image" : "source text";
+	const covers =
+		options.mode === "transcribe"
+			? "all text of the page, in reading order"
+			: `every entry of the requested kind on the ${unitWord}`;
+	return `## When a unit is done
+- A unit is done when its file holds ${covers}, every reading has been checked against the ${source}, and verify reports no errors. Then commit it with verify final=true.
+- Until then, keep working on it. Do not end a turn with a summary, a plan or a question; no one will answer. Take the next step instead.
+- Run verify after your last change. Repeat a check only when you changed something since, or when it failed.
+- Where the ${source} cannot settle a reading, mark it as the rules prescribe instead of guessing.
+- When the session's last unit is committed, stop.`;
 }
 
 function toolsSection(options: PromptOptions): string {
@@ -60,11 +79,25 @@ function toolsSection(options: PromptOptions): string {
 	const lines = ["## Tools"];
 	if (options.inputKind === "images" && tools.has("view")) {
 		lines.push(
-			"- view: the current page is attached to its unit message at the highest resolution the model accepts, so you do not need to view it whole again. `box` ({x, y, w, h} as fractions of page width and height, origin top-left) zooms into a region at full resolution; `grid: true` overlays labelled coordinates to help choose boxes; `enhance` (contrast, grayscale, sharpen, threshold, invert) and `rotate` help with faint, stained or rotated text. The previous and the next page can be viewed with `unit` (catchwords, words or entries running across pages).",
+			"- view: the current page is attached to its unit message at the highest resolution the model accepts, so you do not need to view it whole again. `box` ({x, y, w, h} as fractions of page width and height, origin top-left) zooms into a region at full resolution, `boxes` shows up to four regions in one call (e.g. consecutive bands of the page), and `scale` magnifies up to 8x; `grid: true` overlays labelled coordinates to help choose boxes; `enhance` (contrast, grayscale, sharpen, threshold, invert) and `rotate` help with faint, stained or rotated text. The previous and the next page can be viewed with `unit` (catchwords, words or entries running across pages).",
 		);
 		lines.push(
 			"- To keep requests small, images of earlier units are removed from the conversation once their unit is committed; view a page again if you need it.",
 		);
+	}
+	if (options.inputKind === "images" && tools.has("python")) {
+		lines.push(
+			`- python: runs a Python script (numpy, Pillow, OpenCV where installed) on the page images in source/ and shows you the images it saves to scratch/show/. scratch/pagetools.py has ready-made functions; read it once${tools.has("read") ? " with read" : ""}, call \`pagetools.help()\`, and change or extend it when a task needs something it lacks (the module stays for later pages). ${
+				tools.has("view")
+					? "Use it where view is not enough: a systematic check of the whole page in overlapping bands, line-by-line strips of a dense passage or row-by-row strips of a table composed into the images you need"
+					: "The current page is attached to its unit message at the highest resolution the model accepts; python is your way to look at it again in detail, and at the previous or next page (catchwords, text running across pages): a systematic check of the whole page in overlapping bands, crops of any region, line-by-line strips of a dense passage or row-by-row strips of a table at a magnification you choose"
+			}, side-by-side comparisons of doubtful letter forms or numerals with clear examples elsewhere on the page, projection profiles to find lines and columns, deskewing, binarization or background removal for faint or stained text.`,
+		);
+		if (!tools.has("view")) {
+			lines.push(
+				"- To keep requests small, images of earlier units are removed from the conversation once their unit is committed; show a page again with python if you need it.",
+			);
+		}
 	}
 	const fileTools = (["write", "edit"] as const).filter((name) => tools.has(name));
 	if (fileTools.length > 0) {
@@ -157,9 +190,11 @@ The front matter (YAML) holds every schema field except \`${bodyField}\`; the te
 1. Study the full page attached to the unit message: layout, columns, script, marginalia, page number, catchword, signature mark.
 2. Transcribe the page in reading order into the unit file.
 3. Compare the draft line by line with the image.${
-		options.tools.has("view")
-			? " Zoom into every passage you are unsure about: small or faint type, abbreviations, numerals, names, marginalia, damage."
-			: ""
+		options.tools.has("python")
+			? " Do this with python: go through the whole page systematically, in overlapping bands or line strips (pagetools.bands, pagetools.line_strips; row_strips for tables) magnified until every character is unambiguous, and correct the draft band by band against these images. Zoom further into every passage you are still unsure about: small or faint type, abbreviations, numerals, names, marginalia, damage."
+			: options.tools.has("view")
+				? " Do this with view: go through the whole page systematically, top to bottom, in overlapping bands (each a full column width and a few lines high, magnified only as far as needed to make every character unambiguous: ordinary print often needs scale 1 to 2, very small type up to 8; up to four bands per call with boxes), and correct the draft band by band against these images. Zoom further into every passage you are still unsure about: small or faint type, abbreviations, numerals, names, marginalia, damage."
+				: ""
 	} Correct the file with ${options.tools.has("edit") ? "edit" : options.tools.has("write") ? "write" : "bash"}.
 4. ${uncertaintyInstruction(bodyRules)}
 5. Run verify, fix all errors, then verify with final=true.
@@ -173,7 +208,9 @@ ${bodyRules}
 The unit's data must validate against this JSON Schema:
 ${schemaJson(options.schema)}
 
-${contextSection(options.context)}`.trim();
+${contextSection(options.context)}
+
+${completionSection(options, "page")}`.trim();
 }
 
 /** How the agent corrects a single entry with the tools it has. */
@@ -217,7 +254,9 @@ ${
 		: `- An entry belongs to the ${unitWord} where it begins. If it continues into the next ${unitWord}, ${
 				// view (image units) and read (text units) are mandatory tools, so the next unit can always be looked at.
 				isImages
-					? "view the next page (view with unit=<next id>) to complete it, record the complete entry in the current unit,"
+					? options.tools.has("view")
+						? "view the next page (view with unit=<next id>) to complete it, record the complete entry in the current unit,"
+						: "look at the next page with python (pagetools.page('next')) to complete it, record the complete entry in the current unit,"
 					: "read the next chunk (source/<next id>.txt; the unit message already shows its first lines, and you may read up to two chunks ahead) to complete it, record the complete entry in the current unit,"
 			} and pass \`carry_over\` to verify(final=true) describing where the continuation ends in the next ${unitWord} (quote its last words).
 - If a ${unitWord} begins with the continuation of an entry recorded in the previous unit, the carry-over note in the unit message tells you; skip that part.`
@@ -230,7 +269,13 @@ ${
 			? `Add all entries with add_entries, 1-3 per call in source order, following the field descriptions in the schema exactly${options.tools.has("write") ? " (write the whole file only if that is simpler, e.g. for an empty unit)" : ""}.`
 			: `${options.tools.has("write") ? "Write" : "Create (with bash)"} the unit file with all entries, following the field descriptions in the schema exactly.`
 	}
-3. Check every field against the ${isImages ? (options.tools.has("view") ? "image (zoom into names, numbers, abbreviations and faint passages)" : "image") : "source text"}; correct with ${correctionTools(options)}.
+3. Check every field against the ${
+		isImages
+			? options.tools.has("view")
+				? "image with view: go through the whole page systematically, top to bottom, in overlapping bands (each a full column width and a few entries high, magnified only as far as needed to make every character unambiguous: ordinary print often needs scale 1 to 2, very small type up to 8; up to four bands per call with boxes), compare the entries of each band field by field, and add any entry a band shows that the file lacks. Zoom further into names, numbers, abbreviations and faint passages you are still unsure about"
+				: "image"
+			: "source text"
+	}; correct with ${correctionTools(options)}.
 4. Run verify, fix all errors, then verify with final=true once the ${unitWord} is fully covered.
 
 ## Extraction rules
@@ -242,7 +287,9 @@ ${
 ## Schema (${options.schema.name})
 ${schemaJson(options.schema)}
 
-${contextSection(options.context)}`.trim();
+${contextSection(options.context)}
+
+${completionSection(options, unitWord)}`.trim();
 }
 
 export function buildSystemPrompt(options: PromptOptions): string {

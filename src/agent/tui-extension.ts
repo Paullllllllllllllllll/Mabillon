@@ -16,6 +16,7 @@ import { PdfSource } from "../inputs/pdf.ts";
 import { loadTextDocument } from "../inputs/text.ts";
 import { applyOpenRouterPreferences, openRouterPreferences, withOpenRouterRouting } from "../routing.ts";
 import { loadSchemaFile, resolveSchema } from "../schemas/registry.ts";
+import { applyServiceTier, isOpenAIResponses, withServiceTier } from "../service-tier.ts";
 import { readUtf8File } from "../util.ts";
 import { formatIssues, type Issue } from "../verify/issues.ts";
 import { verifyUnitContent } from "../verify/verify.ts";
@@ -55,24 +56,53 @@ export function createTuiExtension(config: ChronoConfig) {
 			}
 		});
 
-		// The routing travels with the selected model, so that requests outside before_provider_request (pi's
-		// compaction summaries, cache warming) carry it too. Re-selecting the same model keeps the thinking level.
-		const routeModel = async (model: ExtensionContext["model"]) => {
+		// The service tier goes only to OpenAI models used with an API key (not the ChatGPT login).
+		const tierFor = (model: ExtensionContext["model"], ctx: ExtensionContext) =>
+			config.serviceTier && model && isOpenAIResponses(model) && !ctx.modelRegistry.isUsingOAuth(model)
+				? config.serviceTier
+				: undefined;
+
+		// The routing and the service tier travel with the selected model, so that requests outside
+		// before_provider_request (pi's compaction summaries, cache warming) carry them too. Re-selecting the same
+		// model keeps the thinking level.
+		const routeModel = async (model: ExtensionContext["model"], ctx: ExtensionContext) => {
 			if (!model) return;
-			const routed = withOpenRouterRouting(model, openRouterPreferences(config, model));
+			const routed = withServiceTier(
+				withOpenRouterRouting(model, openRouterPreferences(config, model)),
+				tierFor(model, ctx),
+			);
 			if (routed === model) return;
 			const thinking = pi.getThinkingLevel();
 			if ((await pi.setModel(routed)) && pi.getThinkingLevel() !== thinking) {
 				pi.setThinkingLevel(thinking);
 			}
 		};
-		pi.on("session_start", (_event, ctx) => routeModel(ctx.model));
-		pi.on("model_select", (event) => routeModel(event.model));
+		pi.on("session_start", (_event, ctx) => routeModel(ctx.model, ctx));
+		pi.on("model_select", (event, ctx) => routeModel(event.model, ctx));
+
+		// A second layer for the service tier; models off the route are noted once each.
+		const untiered = new Set<string>();
+		const serviceTierFor = (ctx: ExtensionContext) => {
+			const model = ctx.model;
+			if (!config.serviceTier || !model) return undefined;
+			const tier = tierFor(model, ctx);
+			if (tier) return tier;
+			const key = `${model.provider}/${model.id}`;
+			if (ctx.hasUI && !untiered.has(key)) {
+				untiered.add(key);
+				ctx.ui.notify(
+					`Mabillon: service_tier ${config.serviceTier} is not sent for ${key} (OpenAI API key only).`,
+					"info",
+				);
+			}
+			return undefined;
+		};
 
 		// A second layer for requests made while another model object is selected (e.g. after a registry refresh).
 		pi.on("before_provider_request", (event, ctx) => {
 			applyImageParams(event.payload, profileFor(ctx.model));
 			applyOpenRouterPreferences(event.payload, openRouterPreferences(config, ctx.model));
+			applyServiceTier(event.payload, serviceTierFor(ctx));
 			return event.payload;
 		});
 
@@ -106,7 +136,7 @@ export function createTuiExtension(config: ChronoConfig) {
 							{ description: "Region as page fractions: x, y = top-left corner; w, h = size." },
 						),
 					),
-					scale: Type.Optional(Type.Number({ minimum: 0.25, maximum: 4 })),
+					scale: Type.Optional(Type.Number({ minimum: 0.25, maximum: 8 })),
 					rotate: Type.Optional(Type.Number({ description: "Clockwise rotation in degrees." })),
 					enhance: Type.Optional(Type.Array(enhancement)),
 					grid: Type.Optional(Type.Boolean({ description: "Overlay a labelled coordinate grid." })),

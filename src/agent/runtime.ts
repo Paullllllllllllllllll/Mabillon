@@ -1,10 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ChronoConfig, Mode, ToolName } from "../config.ts";
+import type { ChronoConfig, Mode, ServiceTier, ToolName } from "../config.ts";
 import type { ImageProfile } from "../inputs/image-profile.ts";
 import type { ImageLoader, PreparedImage } from "../inputs/images.ts";
 import type { OpenRouterPreferences } from "../routing.ts";
 import type { LoadedSchema } from "../schemas/registry.ts";
+import type { PythonRunner } from "./python-tool.ts";
 import {
 	type DocPaths,
 	type DocState,
@@ -46,11 +47,17 @@ export interface SessionRuntime {
 	imageProfile: ImageProfile;
 	/** OpenRouter provider preferences for the session's model (undefined for other providers). */
 	routing?: OpenRouterPreferences;
+	/** OpenAI service tier sent with the session's requests (set only for OpenAI models used with an API key). */
+	serviceTier?: ServiceTier;
 	/** Upstream providers that served the session's requests (OpenRouter reports them in every stream chunk). */
 	servedBy?: Set<string>;
 	/** pi's compaction reserve for the session's model (from the user's pi settings). */
 	reserveTokens?: number;
 	sources: UnitSources;
+	/** Size (base64 characters) of the current unit's page image as delivered; it is protected in every request. */
+	pageImageBytes?: number;
+	/** Runs the python tool's scripts (default: the local interpreter; tests inject their own). */
+	pythonRunner?: PythonRunner;
 	/** Consecutive units closed for review in this run of the document (shared by its sessions), and the limit. */
 	reviewStreak?: { count: number; limit: number };
 	persist(): void;

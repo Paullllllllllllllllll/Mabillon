@@ -1,4 +1,4 @@
-import { existsSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,9 +7,10 @@ import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-
 import { Type } from "typebox";
 import type { ToolName } from "../config.ts";
 import { applyImageParams } from "../inputs/image-profile.ts";
-import { describePrepared, ENHANCEMENTS, type Enhancement, prepareImage } from "../inputs/images.ts";
+import { type Box, describePrepared, ENHANCEMENTS, type Enhancement, loadRaw, prepareImage } from "../inputs/images.ts";
 import { applyOpenRouterPreferences, servingProvider } from "../routing.ts";
 import { boundaryPolicy, envelopeInfo } from "../schemas/registry.ts";
+import { applyServiceTier } from "../service-tier.ts";
 import { readUtf8File, writeFileAtomic } from "../util.ts";
 import { formatIssues, type Issue } from "../verify/issues.ts";
 import {
@@ -44,6 +45,22 @@ import {
 	sanitizeBuiltinResult,
 	softCapRefusal,
 } from "./notices.ts";
+import {
+	CALL_SCRIPT,
+	clearShown,
+	describeShown,
+	HELPER_NAME,
+	installHelper,
+	localPythonRunner,
+	MAX_SHOWN_IMAGES,
+	materializePage,
+	plainDir,
+	prepareShown,
+	pythonEnvironment,
+	SHOW_DIR,
+	shownFiles,
+	tail,
+} from "./python-tool.ts";
 import { committedPath, neighbor, type SessionRuntime } from "./runtime.ts";
 import { sha256Text, type UnitRecord, unitFile } from "./state.ts";
 
@@ -74,6 +91,15 @@ export interface ChronoExtensionHandle {
 /** pi's default reserve for the model's response (settings compaction.reserveTokens). */
 export const PI_RESERVE_TOKENS = 16_384;
 const OMITTED_IMAGE = "[image of an earlier unit omitted to save context; view it again if needed]";
+/** Regions one view call can show, and its largest magnification. */
+export const MAX_VIEW_BOXES = 4;
+export const MAX_VIEW_SCALE = 8;
+const VIEW_BOX = {
+	x: Type.Number({ minimum: 0, maximum: 1 }),
+	y: Type.Number({ minimum: 0, maximum: 1 }),
+	w: Type.Number({ minimum: 0, maximum: 1 }),
+	h: Type.Number({ minimum: 0, maximum: 1 }),
+};
 const OMITTED_OLD_VIEW = "[older image omitted to stay within the provider's request limits; view again if needed]";
 
 function toPosix(path: string): string {
@@ -524,7 +550,7 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 					issues.push({
 						severity: "error",
 						layer: "process",
-						message: notInContext(runtime.inputKind, unit.id),
+						message: notInContext(runtime.inputKind, unit.id, runtime.tools),
 					});
 				}
 				const errors = issues.filter((issue) => issue.severity === "error");
@@ -855,29 +881,27 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 			const viewTool = defineTool({
 				name: "view",
 				label: "View",
-				description:
-					"Show a page image: a region at full resolution (box), optionally enhanced, rotated, or with a coordinate grid; or the whole page. Available pages: the current page, the previous page and the next page. The current page is already attached to the unit message.",
+				description: `Show a page image: a region at full resolution (box), or up to ${MAX_VIEW_BOXES} regions in one call (boxes, one image each), optionally magnified, enhanced, rotated, or with a coordinate grid; or the whole page. Available pages: the current page, the previous page and the next page. The current page is already attached to the unit message.`,
 				parameters: Type.Object({
 					unit: Type.Optional(Type.String({ description: "Page id, e.g. p0007. Default: the current page." })),
 					box: Type.Optional(
-						Type.Object(
-							{
-								x: Type.Number({ minimum: 0, maximum: 1 }),
-								y: Type.Number({ minimum: 0, maximum: 1 }),
-								w: Type.Number({ minimum: 0, maximum: 1 }),
-								h: Type.Number({ minimum: 0, maximum: 1 }),
-							},
-							{
-								description:
-									"Region as fractions of the page: x, y = top-left corner; w, h = width and height. {x:0, y:0, w:0.5, h:0.5} is the top-left quarter.",
-							},
-						),
+						Type.Object(VIEW_BOX, {
+							description:
+								"Region as fractions of the page: x, y = top-left corner; w, h = width and height. {x:0, y:0, w:0.5, h:0.5} is the top-left quarter.",
+						}),
+					),
+					boxes: Type.Optional(
+						Type.Array(Type.Object(VIEW_BOX), {
+							minItems: 1,
+							maxItems: MAX_VIEW_BOXES,
+							description: `Up to ${MAX_VIEW_BOXES} regions (as box) shown in one call, one image each, in the order given; the other options apply to each. Use instead of box, e.g. for consecutive bands of a page.`,
+						}),
 					),
 					scale: Type.Optional(
 						Type.Number({
 							minimum: 0.25,
-							maximum: 4,
-							description: "Extra magnification of the region (default: small regions are enlarged up to 3x).",
+							maximum: MAX_VIEW_SCALE,
+							description: `Extra magnification of the region, up to ${MAX_VIEW_SCALE}x (default: small regions are enlarged up to 3x). The model's image size limit can lower it.`,
 						}),
 					),
 					rotate: Type.Optional(Type.Number({ description: "Clockwise rotation in degrees, e.g. 90." })),
@@ -913,39 +937,216 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 							isError: true,
 						};
 					}
-					active.views = (active.views ?? 0) + 1;
-					const plain = !params.box && !params.enhance?.length && !params.rotate && !params.grid && !params.scale;
+					if (params.box && params.boxes) {
+						return {
+							content: [{ type: "text", text: "Pass either box or boxes, not both." }],
+							details: undefined,
+							isError: true,
+						};
+					}
+					const regions: Array<Box | undefined> = params.boxes ?? [params.box];
+					// A batch must fit next to the images every request keeps (context images and the unit's page);
+					// otherwise the context hook, which keeps the newest images first, would drop its first regions.
+					const profile = runtime.imageProfile;
+					const keptBytes =
+						runtime.contextImages.reduce((sum, context) => sum + context.image.data.length, 0) +
+						(runtime.pageImageBytes ?? 0);
+					const slots = Math.max(1, profile.maxRequestImages - runtime.contextImages.length - 1);
+					if (regions.length > slots) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `At most ${slots} region(s) fit into one request next to the page for this model; view fewer boxes per call.`,
+								},
+							],
+							details: undefined,
+							isError: true,
+						};
+					}
+					active.views = (active.views ?? 0) + regions.length;
+					const plain =
+						!params.box &&
+						!params.boxes &&
+						!params.enhance?.length &&
+						!params.rotate &&
+						!params.grid &&
+						!params.scale;
 					if (plain && target.id === active.id && delivered.has(active.id)) {
 						return {
 							content: [
 								{
 									type: "text",
-									text: `The full page ${active.id} is already in the conversation (attached to the unit message), at the highest resolution the model accepts. Use box to zoom into a region, or enhance, rotate or grid.`,
+									text: `The full page ${active.id} is already in the conversation (attached to the unit message), at the highest resolution the model accepts. Use box or boxes to zoom into regions, or enhance, rotate or grid.`,
 								},
 							],
-							details: { unit: target.id, box: params.box },
+							details: { unit: target.id, box: params.box, boxes: undefined as number | undefined },
 						};
 					}
 					const { key, loader } = runtime.sources.image(target);
-					const image = await prepareImage(key, loader, {
-						box: params.box,
-						scale: params.scale,
-						rotate: params.rotate,
-						enhance: params.enhance as Enhancement[] | undefined,
-						grid: params.grid,
-						limits: runtime.imageProfile,
-					});
-					if (target.id === active.id && !params.box) delivered.add(active.id);
+					const content: Array<TextContent | ImageContent> = [];
+					let batchBytes = 0;
+					for (const [index, region] of regions.entries()) {
+						const image = await prepareImage(key, loader, {
+							box: region,
+							scale: params.scale,
+							rotate: params.rotate,
+							enhance: params.enhance as Enhancement[] | undefined,
+							grid: params.grid,
+							limits: runtime.imageProfile,
+						});
+						const label =
+							regions.length > 1
+								? `Page ${target.id}, region ${index + 1} of ${regions.length}`
+								: `Page ${target.id}`;
+						content.push({ type: "text", text: describePrepared(label, image) });
+						content.push({ type: "image", data: image.data, mimeType: image.mimeType });
+						batchBytes += image.data.length;
+					}
+					if (regions.length > 1 && keptBytes + batchBytes > profile.maxRequestImageBytes) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `These ${regions.length} regions together exceed the image data one request can carry for this model; view fewer or smaller regions per call, or a lower scale.`,
+								},
+							],
+							details: undefined,
+							isError: true,
+						};
+					}
+					if (target.id === active.id && !params.box && !params.boxes) delivered.add(active.id);
 					return {
-						content: [
-							{ type: "text", text: describePrepared(`Page ${target.id}`, image) },
-							{ type: "image", data: image.data, mimeType: image.mimeType },
-						],
-						details: { unit: target.id, box: params.box },
+						content,
+						details: { unit: target.id, box: params.box, boxes: params.boxes?.length },
 					};
 				},
 			});
 			pi.registerTool(viewTool);
+		}
+
+		if (runtime.inputKind === "images" && has("python")) {
+			installHelper(runtime.workDir);
+			const runner = runtime.pythonRunner ?? localPythonRunner;
+			pi.registerTool(
+				defineTool({
+					name: "python",
+					label: "Python",
+					description: `Run a Python script on the page images, with the work directory as the current directory. The current page is the file in the environment variable MABILLON_PAGE (source/<id>.png, full resolution, lossless); the previous and next pages are in MABILLON_PREVIOUS_PAGE and MABILLON_NEXT_PAGE. scratch/${HELPER_NAME} is a helper module you can import and change. Images the script saves to ${SHOW_DIR}/ (emptied before every call) are shown to you, at most ${MAX_SHOWN_IMAGES} per call, never enlarged: scale them yourself. stdout and stderr are returned.${runtime.config.pythonSandbox ? " The script runs in a sandbox: no network access, and it can write only under scratch/." : ""}`,
+					parameters: Type.Object({
+						code: Type.String({ description: "The Python script." }),
+					}),
+					executionMode: "sequential",
+					async execute(_toolCallId, params, signal) {
+						const active = current();
+						if (!active) {
+							return {
+								content: [{ type: "text", text: "All units of this session are finished. Stop now." }],
+								details: undefined,
+								terminate: true,
+							};
+						}
+						const pages: Record<"current" | "previous" | "next", UnitRecord | undefined> = {
+							current: active,
+							previous: neighbor(runtime, active, -1),
+							next: neighbor(runtime, active, 1),
+						};
+						const relPaths: { current: string; previous?: string; next?: string } = {
+							current: `source/${active.id}.png`,
+						};
+						for (const [role, unit] of Object.entries(pages)) {
+							if (!unit) continue;
+							const rel = `source/${unit.id}.png`;
+							const { key, loader } = runtime.sources.image(unit);
+							await materializePage(join(runtime.workDir, rel), key, loader);
+							relPaths[role as "current" | "previous" | "next"] = rel;
+						}
+						// Also as a file: a sandboxed interpreter may start with a fresh environment.
+						writeFileAtomic(join(runtime.workDir, "source", "pages.json"), `${JSON.stringify(relPaths)}\n`);
+						try {
+							clearShown(runtime.workDir);
+							plainDir(runtime.workDir, "scratch/tmp");
+							// A link in place of the script would send Mabillon's write elsewhere; it is removed, not followed.
+							const script = join(runtime.workDir, CALL_SCRIPT);
+							if (lstatSync(script, { throwIfNoEntry: false })?.isSymbolicLink()) unlinkSync(script);
+							writeFileAtomic(script, params.code);
+						} catch (error) {
+							return {
+								content: [{ type: "text", text: `The script was not run: ${(error as Error).message}.` }],
+								details: undefined,
+								isError: true,
+							};
+						}
+						const run = await runner({
+							python: runtime.config.pythonPath,
+							args: ["-X", "utf8", CALL_SCRIPT],
+							cwd: runtime.workDir,
+							env: pythonEnvironment(runtime.workDir, relPaths),
+							timeoutMs: runtime.config.pythonTimeout * 1000,
+							signal,
+						});
+						const blocks: Array<TextContent | ImageContent> = [];
+						const lines = [
+							run.timedOut
+								? `Stopped after ${runtime.config.pythonTimeout} s (time limit).`
+								: `Exit code ${run.exitCode}.`,
+						];
+						let files: string[] = [];
+						try {
+							files = shownFiles(runtime.workDir);
+						} catch (error) {
+							lines.push(`No images shown: ${(error as Error).message}.`);
+						}
+						if (run.stdout.trim()) lines.push(`stdout:\n${tail(run.stdout)}`);
+						if (run.stderr.trim()) lines.push(`stderr:\n${tail(run.stderr)}`);
+						const shown = files.slice(0, MAX_SHOWN_IMAGES);
+						const images: Array<{ name: string; image: Awaited<ReturnType<typeof prepareShown>> }> = [];
+						for (const name of shown) {
+							try {
+								images.push({
+									name,
+									image: await prepareShown(join(runtime.workDir, SHOW_DIR, name), runtime.imageProfile),
+								});
+							} catch (error) {
+								lines.push(`${SHOW_DIR}/${name} could not be read as an image: ${(error as Error).message}`);
+							}
+						}
+						if (files.length > shown.length) {
+							lines.push(
+								`Only the first ${MAX_SHOWN_IMAGES} images (in name order) are shown; not shown: ${files.slice(MAX_SHOWN_IMAGES).join(", ")}.`,
+							);
+						}
+						if (images.length > 0) active.views = (active.views ?? 0) + images.length;
+						if (!has("view") && images.length > 0) {
+							// Without view, an image of the page's full size puts the whole page back into the context.
+							const { key, loader } = runtime.sources.image(active);
+							const page = await loadRaw(key, loader);
+							if (
+								images.some(
+									({ image }) => image.sourceWidth === page.width && image.sourceHeight === page.height,
+								)
+							) {
+								delivered.add(active.id);
+							}
+						}
+						blocks.push({ type: "text", text: lines.join("\n") });
+						for (const { name, image } of images) {
+							blocks.push({ type: "text", text: describeShown(name, image) });
+							blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+						}
+						return {
+							content: blocks,
+							details: {
+								unit: active.id,
+								exitCode: run.exitCode,
+								timedOut: run.timedOut,
+								images: images.length,
+							},
+							isError: run.timedOut || run.exitCode !== 0,
+						};
+					},
+				}),
+			);
 		}
 
 		// pi's built-in tools may suggest tools the agent does not have (read: "Use bash: sed ..."); such hints are
@@ -966,6 +1167,7 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 		pi.on("before_provider_request", (event) => {
 			applyImageParams(event.payload, runtime.imageProfile);
 			applyOpenRouterPreferences(event.payload, runtime.routing);
+			applyServiceTier(event.payload, runtime.serviceTier);
 			return event.payload;
 		});
 
@@ -1101,11 +1303,14 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 			const ownFile = key === unitKey || key === "notes.md";
 			const rereadsUnit =
 				!delivered.has(unit.id) &&
-				((toolName === "view" && !input.box && (input.unit === undefined || input.unit === unit.id)) ||
+				((toolName === "view" &&
+					!input.box &&
+					!input.boxes &&
+					(input.unit === undefined || input.unit === unit.id)) ||
 					(toolName === "read" && key === gatePath(`source/${unit.id}.txt`)));
 			if (
 				used > config.toolSoftCap &&
-				(toolName === "view" || toolName === "read" || toolName === "bash") &&
+				(toolName === "view" || toolName === "read" || toolName === "bash" || toolName === "python") &&
 				!ownFile &&
 				!rereadsUnit
 			) {

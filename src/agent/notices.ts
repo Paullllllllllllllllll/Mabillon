@@ -58,7 +58,10 @@ export function coverageRefusal(tools: Tools, file: string, warning: string): st
 }
 
 /** final=true while the unit's page or text is no longer in the conversation (view and read are mandatory). */
-export function notInContext(inputKind: "images" | "text", unitId: string): string {
+export function notInContext(inputKind: "images" | "text", unitId: string, tools?: Tools): string {
+	if (inputKind === "images" && tools && !tools.has("view")) {
+		return `the page ${unitId} is not in the current context; show the full page with python (pagetools.show(pagetools.page())), check the file, then commit`;
+	}
 	return inputKind === "images"
 		? `the page ${unitId} is not in the current context; call view without box to show the full page, check the file, then commit`
 		: `the text of ${unitId} is not in the current context; read source/${unitId}.txt (whole file), check the file, then commit`;

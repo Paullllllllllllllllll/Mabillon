@@ -62,6 +62,8 @@ export interface SessionRecord {
 	imageProfile?: string;
 	/** OpenRouter provider preferences sent with the session's requests. */
 	routing?: Record<string, unknown>;
+	/** OpenAI service tier requested for the session's requests (service_tier). */
+	serviceTier?: string;
 	/** Upstream providers that served the session's requests, as OpenRouter reports them. */
 	servedBy?: string[];
 	compactions?: number;

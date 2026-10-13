@@ -8,11 +8,17 @@ export type Mode = "transcribe" | "extract";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+/** OpenAI service tiers (the `service_tier` request field); only for OpenAI models used with an API key. */
+export const SERVICE_TIERS = ["flex", "priority", "auto", "default"] as const;
+export type ServiceTier = (typeof SERVICE_TIERS)[number];
+
 export interface ChronoConfig {
 	/** Model as "provider/id" (or any pattern pi's --model accepts). Falls back to pi's default model. */
 	model?: string;
 	/** Reasoning effort. Falls back to pi's default thinking level. */
 	thinking?: ThinkingLevel;
+	/** OpenAI service tier sent with every request (OpenAI API key only; flex halves the price). */
+	serviceTier?: ServiceTier;
 	/** Output directory. Defaults to "<input folder>/mabillon_output". */
 	out?: string;
 	/** Schema name (bundled or from schemasDirs) or path. */
@@ -58,6 +64,14 @@ export interface ChronoConfig {
 	tools?: string[];
 	/** true adds bash to the tool set, false removes it (the default set has no bash). */
 	bash?: boolean;
+	/** true adds python (image units) to the tool set, false removes it (the default set has no python). */
+	python?: boolean;
+	/** Python interpreter for the python tool (needs numpy and Pillow; OpenCV is used when present). */
+	pythonPath: string;
+	/** Seconds a python tool call may run before it is stopped. */
+	pythonTimeout: number;
+	/** Run the python tool's scripts in the OS sandbox (no network, writes only to scratch/); false runs them as you. */
+	pythonSandbox: boolean;
 	/** Fall back to a lower image fidelity when a provider rejects the image parameters (false: fail the document). */
 	imageFallback: boolean;
 	/** Accept ChronoMiner line ranges that leave source lines uncovered (recorded in the metadata). */
@@ -93,6 +107,9 @@ export const DEFAULT_CONFIG: ChronoConfig = {
 	autoContext: true,
 	force: false,
 	redoReview: false,
+	pythonPath: "python",
+	pythonTimeout: 120,
+	pythonSandbox: true,
 	imageFallback: true,
 	allowPartialRanges: false,
 	groundingThreshold: 0.8,
@@ -106,6 +123,7 @@ const KEY_ALIASES: Record<string, keyof ChronoConfig> = {
 	thinking: "thinking",
 	reasoning: "thinking",
 	reasoningeffort: "thinking",
+	servicetier: "serviceTier",
 	out: "out",
 	output: "out",
 	schema: "schema",
@@ -132,6 +150,10 @@ const KEY_ALIASES: Record<string, keyof ChronoConfig> = {
 	force: "force",
 	redoreview: "redoReview",
 	bash: "bash",
+	python: "python",
+	pythonpath: "pythonPath",
+	pythontimeout: "pythonTimeout",
+	pythonsandbox: "pythonSandbox",
 	tools: "tools",
 	imagefallback: "imageFallback",
 	allowpartialranges: "allowPartialRanges",
@@ -155,9 +177,11 @@ const NUMBER_KEYS = new Set<keyof ChronoConfig>([
 	"chunkTokens",
 	"concurrency",
 	"groundingThreshold",
+	"pythonTimeout",
 ]);
 /** Counts and sizes that must be at least 1 (compactAtTokens and settleRetries may be 0). */
 const POSITIVE_KEYS = new Set<keyof ChronoConfig>([
+	"pythonTimeout",
 	"unitsPerSession",
 	"toolSoftCap",
 	"toolHardCap",
@@ -172,6 +196,8 @@ const BOOLEAN_KEYS = new Set<keyof ChronoConfig>([
 	"force",
 	"redoReview",
 	"bash",
+	"python",
+	"pythonSandbox",
 	"imageFallback",
 	"allowPartialRanges",
 	"verbose",
@@ -203,9 +229,19 @@ function parseNameList(value: unknown): string[] {
 }
 
 /** Tools the agent can be given. */
-export const TOOL_NAMES = ["read", "write", "edit", "bash", "view", "verify", "add_entries", "update_entry"] as const;
+export const TOOL_NAMES = [
+	"read",
+	"write",
+	"edit",
+	"bash",
+	"view",
+	"python",
+	"verify",
+	"add_entries",
+	"update_entry",
+] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
-/** The default tool set (bash is opt-in). */
+/** The default tool set (bash and python are opt-in). */
 export const DEFAULT_TOOLS: ToolName[] = ["read", "write", "edit", "view", "verify", "add_entries", "update_entry"];
 
 function parseTools(value: unknown): ToolName[] {
@@ -221,18 +257,23 @@ function parseTools(value: unknown): ToolName[] {
 }
 
 /**
- * The tools a session gets: the configured set (default DEFAULT_TOOLS), with --bash/--no-bash applied, minus tools
- * that do not apply here (view only for image units, add_entries and update_entry only in extraction with an
- * entries schema). Returned in TOOL_NAMES order.
+ * The tools a session gets: the configured set (default DEFAULT_TOOLS), with --bash/--no-bash and
+ * --python/--no-python applied, minus tools that do not apply here (view and python only for image units, add_entries
+ * and update_entry only in extraction with an entries schema). Returned in TOOL_NAMES order.
  */
 export function effectiveTools(
-	config: Pick<ChronoConfig, "tools" | "bash">,
+	config: Pick<ChronoConfig, "tools" | "bash" | "python">,
 	where: { mode: Mode; inputKind: "images" | "text"; entries: boolean },
 ): ToolName[] {
 	const wanted = new Set<ToolName>(config.tools ? parseTools(config.tools) : DEFAULT_TOOLS);
 	if (config.bash === true) wanted.add("bash");
 	if (config.bash === false) wanted.delete("bash");
-	if (where.inputKind !== "images") wanted.delete("view");
+	if (config.python === true) wanted.add("python");
+	if (config.python === false) wanted.delete("python");
+	if (where.inputKind !== "images") {
+		wanted.delete("view");
+		wanted.delete("python");
+	}
 	if (where.mode !== "extract" || !where.entries) {
 		wanted.delete("add_entries");
 		wanted.delete("update_entry");
@@ -241,16 +282,16 @@ export function effectiveTools(
 }
 
 /**
- * Refuse tool sets an agent cannot work with: verify always, view for image units and read for text units are
- * required (without them the agent cannot see the unit again or look ahead), and some tool must create the unit file
- * (transcription: write; extraction: write or add_entries).
+ * Refuse tool sets an agent cannot work with: verify always, view or python for image units and read for text units
+ * are required (without them the agent cannot see the unit again or look ahead), and some tool must create the unit
+ * file (transcription: write; extraction: write or add_entries).
  */
 export function checkToolSet(tools: readonly ToolName[], where: { mode: Mode; inputKind: "images" | "text" }): void {
 	const has = (name: ToolName) => tools.includes(name);
 	const kind = where.inputKind === "images" ? "image" : "text";
 	const missing = [
 		...(has("verify") ? [] : ["verify"]),
-		...(where.inputKind === "images" && !has("view") ? ["view"] : []),
+		...(where.inputKind === "images" && !has("view") && !has("python") ? ["view (or python)"] : []),
 		...(where.inputKind === "text" && !has("read") ? ["read"] : []),
 	];
 	if (missing.length > 0) {
@@ -325,11 +366,20 @@ export function coerceConfigValue(key: keyof ChronoConfig, value: unknown, baseD
 		}
 		return level;
 	}
+	if (key === "serviceTier") {
+		const tier = String(value).trim().toLowerCase();
+		if (!(SERVICE_TIERS as readonly string[]).includes(tier)) {
+			throw new Error(`Config "serviceTier" must be one of ${SERVICE_TIERS.join(", ")}, not "${value}"`);
+		}
+		return tier;
+	}
 	if (LIST_KEYS.has(key)) {
 		const list = Array.isArray(value) ? value.map(String) : [String(value)];
 		return PATH_KEYS.has(key) ? list.map((item) => resolve(baseDir, item)) : list;
 	}
 	if (PATH_KEYS.has(key)) return resolve(baseDir, String(value));
+	// An interpreter given as a path is relative to the config file; a bare name is looked up on PATH.
+	if (key === "pythonPath" && /[\\/]/.test(String(value))) return resolve(baseDir, String(value));
 	// A schema given as a file path is relative to the config file (names are looked up as they are).
 	if (key === "schema" && /[\\/]|\.json$/i.test(String(value))) return resolve(baseDir, String(value));
 	return String(value);
