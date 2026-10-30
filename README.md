@@ -1,5 +1,7 @@
 # Mabillon v0.9.0
 
+<img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
+
 Mabillon is an agent for transcribing historical sources and extracting
 schema-validated structured data from them. It is named after Jean Mabillon
 (1632-1707), whose *De re diplomatica* founded the critical study of documents.
