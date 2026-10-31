@@ -1,0 +1,34 @@
+{
+	"name": "FixtureRecipeEntries",
+	"strict": true,
+	"schema": {
+		"type": "object",
+		"properties": {
+			"contains_no_content_of_requested_type": {
+				"type": "boolean",
+				"description": "True when the text holds no recipe."
+			},
+			"entries": {
+				"type": "array",
+				"description": "One entry per recipe, in the order printed.",
+				"items": {
+					"type": "object",
+					"properties": {
+						"title_original": {
+							"type": ["string", "null"],
+							"description": "Title as printed, or null when the recipe has none."
+						},
+						"text_original": {
+							"type": "string",
+							"description": "Full text of the recipe as printed, title excluded."
+						}
+					},
+					"required": ["title_original", "text_original"],
+					"additionalProperties": false
+				}
+			}
+		},
+		"required": ["contains_no_content_of_requested_type", "entries"],
+		"additionalProperties": false
+	}
+}

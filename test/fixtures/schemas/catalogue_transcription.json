@@ -1,0 +1,27 @@
+{
+	"name": "fixture_catalogue_transcription",
+	"strict": true,
+	"schema": {
+		"type": "object",
+		"properties": {
+			"image_analysis": {
+				"type": "string",
+				"description": "Short description of the page layout."
+			},
+			"transcription": {
+				"type": ["string", "null"],
+				"description": "Markdown transcription of the catalogue page.\n- Lot headings as <lot>...</lot>, prices as <price>...</price>.\n- Tables as HTML <table> elements.\n- Unreadable words as [illegible].\nNull when the page has no text."
+			},
+			"no_transcribable_text": {
+				"type": "boolean",
+				"description": "True when the page holds no text."
+			},
+			"transcription_not_possible": {
+				"type": "boolean",
+				"description": "True when the page cannot be read."
+			}
+		},
+		"required": ["image_analysis", "transcription", "no_transcribable_text", "transcription_not_possible"],
+		"additionalProperties": false
+	}
+}

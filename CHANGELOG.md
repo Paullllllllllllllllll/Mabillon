@@ -1,5 +1,15 @@
 # Changelog
 
+- **v0.9.1** (31 October 2026) -- First public release. The bundled extraction
+  schemas are now ChronoMiner's eight example schemas (`PriceListEntries`,
+  `BibliographicCatalogueEntries` and others); the earlier project schemas and their
+  rules files are no longer bundled, so pass them with `--schemas-dir`. The bundled
+  transcription schemas are ChronoTranscriber's `markdown_transcription_schema`,
+  `plain_text_transcription_schema` and `plain_text_transcription_with_markers_schema`
+  as of 02.10.2026 (commit `d4a4afd`), unchanged since v0.7.1, beside Mabillon's own
+  default `diplomatic_markdown_transcription`. Tests use schema fixtures in
+  `test/fixtures/schemas/`. The public history keeps the benchmark versions v0.7.1,
+  v0.7.2 and v0.9.0 as snapshots of their runtime code and bundled public schemas.
 - **v0.9.0** (13 October 2026) -- `view` takes `boxes`, up to four page regions in
   one call with one image each, and magnifies up to 8x; a batch that would not fit
   into one request next to the context images and the unit's page is refused with

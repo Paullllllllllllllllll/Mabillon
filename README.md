@@ -1,4 +1,4 @@
-# Mabillon v0.9.0
+# Mabillon v0.9.1
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 
@@ -113,15 +113,15 @@ mabillon transcribe book.pdf --model openai/gpt-6-luna --thinking medium
 # Transcribe a folder of page scans, 20 pages per agent session
 mabillon transcribe scans/book_1747/ --units-per-session 20
 
-# Extract recipes from the transcription produced above
-mabillon extract mabillon_output/book/book.md --schema <schema>
+# Extract price-list entries from the transcription produced above
+mabillon extract mabillon_output/book/book.md --schema PriceListEntries
 
-# Extract bibliographic records directly from page images, first 40 pages only
-mabillon extract catalogue.pdf --schema <schema> --units 1-40
+# Extract catalogue records directly from page images, first 40 pages only
+mabillon extract catalogue.pdf --schema BibliographicCatalogueEntries --units 1-40
 
 # Validate any file against a schema (no model involved)
 mabillon verify mabillon_output/book/book.json
-mabillon verify entries.json --schema <schema> --source catalogue.docx
+mabillon verify entries.json --schema BibliographicCatalogueEntries --source catalogue.docx
 
 # List bundled and user schemas
 mabillon schemas
@@ -521,8 +521,11 @@ Bundled schemas live in `schemas/`:
 - `transcription/diplomatic_markdown_transcription.json` (default): diplomatic
   transcription with markdown structure, `<page_number>`, footnotes,
   `![Image: ...]`, and the uncertainty markers `<unclear>...</unclear>` and `<gap/>`;
-- copies of three ChronoTranscriber transcription schemas;
-- no extraction schemas in this public snapshot; pass them with `--schemas-dir`.
+- `transcription/markdown_transcription_schema.json`,
+  `plain_text_transcription_schema.json` and
+  `plain_text_transcription_with_markers_schema.json`: copies of ChronoTranscriber's
+  transcription schemas as of 02.10.2026 (commit `d4a4afd`);
+- `extraction/`: copies of ChronoMiner's example extraction schemas.
 
 `mabillon schemas` lists them together with any schema file that could not be
 loaded and the reason (`load_errors` with `--json`).
@@ -536,7 +539,7 @@ Optional rules files sit in a `rules/` folder next to the schema (or in
 
 ```json
 {
-  "verbatimFields": ["recipe_text_original", "title_original"],
+  "verbatimFields": ["text_original", "title_original"],
   "bodyField": "transcription"
 }
 ```
@@ -547,7 +550,8 @@ field of a transcription schema that receives the Markdown body of a unit file.
 `"complete"` (default) records the whole entry in the unit where it begins, reading
 ahead and passing a carry-over note; `"fragments"` records each unit's part as its
 own entry flagged as a fragment. Without the key, a schema whose entries have a
-boolean field with "fragment" in its name (such as `entry_is_fragment`) uses `"fragments"`.
+boolean field with "fragment" in its name (such as `entry_is_fragment`) uses
+`"fragments"`.
 
 Extraction schemas must have a top-level `entries` array (optionally with
 `contains_no_content_of_requested_type` and other top-level fields), since the

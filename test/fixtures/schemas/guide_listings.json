@@ -1,0 +1,38 @@
+{
+	"name": "FixtureGuideListings",
+	"strict": true,
+	"schema": {
+		"type": "object",
+		"properties": {
+			"contains_no_content_of_requested_type": {
+				"type": "boolean",
+				"description": "True when the page holds no listing."
+			},
+			"active_city_or_town": {
+				"type": ["string", "null"],
+				"description": "Town heading in force on the page, also when printed on an earlier page; null when none is known."
+			},
+			"entries": {
+				"type": "array",
+				"description": "One entry per listing, in the order printed.",
+				"items": {
+					"type": "object",
+					"properties": {
+						"listing_name": {
+							"type": ["string", "null"],
+							"description": "Name of the listed business as printed."
+						},
+						"entry_is_fragment": {
+							"type": "boolean",
+							"description": "True when the listing continues from or onto another page."
+						}
+					},
+					"required": ["listing_name", "entry_is_fragment"],
+					"additionalProperties": false
+				}
+			}
+		},
+		"required": ["contains_no_content_of_requested_type", "active_city_or_town", "entries"],
+		"additionalProperties": false
+	}
+}
