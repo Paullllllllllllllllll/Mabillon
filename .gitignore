@@ -6,3 +6,9 @@ coverage/
 test/.tmp/
 AGENTS.md
 docs/
+
+# Agent and T3 Code files (local only)
+CLAUDE.md
+.claude/
+t3.json
+.t3-icon.svg
