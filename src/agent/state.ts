@@ -43,6 +43,10 @@ export interface UnitRecord {
 	 * ChronoMiner keep the tool column when they do), and a finished unit is then worked again.
 	 */
 	storeRow?: { status: string; stale: number; runId: string };
+	/** Correction mode: the stored unit this unit's file was seeded from, and the sha256 of the seeded file. */
+	draft?: DraftRecord;
+	/** Correction mode: the stored draft could not be read, so the unit is worked from scratch (and not adopted). */
+	draftRejected?: boolean;
 	/**
 	 * Extraction: entries add_entries rejected that no later call resolved (kept across sessions until the unit is
 	 * committed or reset), and the number of the next rejection ID.
@@ -113,7 +117,18 @@ export function unitsDigest(units: UnitRecord[]): string {
 	return sha256Text(JSON.stringify(units.map((unit) => [unit.id, unit.status, unit.contentHash ?? null])));
 }
 
+/** Where a correction-mode draft came from: the store, its document and unit run, and the seeded file's sha256. */
+export interface DraftRecord {
+	store: string;
+	document: string;
+	tool: string;
+	runId: string;
+	sha256: string;
+}
+
 export interface DocState {
+	/** Correction mode: the drafts store document; `ranges` when its ChronoMiner chunks gave the units. */
+	drafts?: { store: string; document: string; ranges?: boolean };
 	version: 2;
 	mabillonVersion: string;
 	mode: Mode;

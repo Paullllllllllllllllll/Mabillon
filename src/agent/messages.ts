@@ -8,7 +8,7 @@ import { formatIssue } from "../verify/issues.ts";
 import { parseTranscriptionUnit } from "../verify/rules.ts";
 import { canKeepNotes, closingInstruction, rejectionList } from "./notices.ts";
 import { neighbor, readCommitted, type SessionRuntime } from "./runtime.ts";
-import { chunkFile, isDone, type UnitRecord, unitFile } from "./state.ts";
+import { chunkFile, isDone, sha256Text, type UnitRecord, unitFile } from "./state.ts";
 
 export type MessageContent = Array<TextContent | ImageContent>;
 
@@ -90,7 +90,20 @@ export function carryOverNote(runtime: SessionRuntime, unit: UnitRecord): string
 
 /** Note about a draft left by an earlier, interrupted or reviewed attempt at this unit. */
 function draftNote(runtime: SessionRuntime, unit: UnitRecord): string | undefined {
-	if (!existsSync(join(runtime.workDir, unitFile(runtime.mode, unit)))) return undefined;
+	const path = join(runtime.workDir, unitFile(runtime.mode, unit));
+	if (!existsSync(path)) {
+		// Correction mode: the system prompt speaks of a draft in every unit file; this unit has none.
+		return runtime.config.drafts !== undefined && !unit.draft
+			? `There is no draft for this unit: ${unitFile(runtime.mode, unit)} does not exist. Create it from the ${runtime.inputKind === "text" ? "source text" : "image"}.`
+			: undefined;
+	}
+	// Correction mode: the unit file still holds the draft seeded from the store (its content is not repeated here).
+	if (unit.draft && sha256Text(readUtf8File(path).text) === unit.draft.sha256) {
+		const what = runtime.mode === "transcribe" ? "a transcription" : "an extraction";
+		const unitWord = runtime.inputKind === "text" ? "chunk" : "page";
+		const against = runtime.inputKind === "text" ? "the source text" : "the image";
+		return `${unitFile(runtime.mode, unit)} holds ${what} of this ${unitWord} that contains errors. Correct it against ${against}.`;
+	}
 	const why = unit.closedReason ? ` (it was closed for review earlier: ${unit.closedReason})` : "";
 	const draft = `A draft from an earlier attempt exists in ${unitFile(runtime.mode, unit)}${why}. Check it against the source and improve it rather than starting over.`;
 	const issues = [...(unit.issues ?? [])].sort(

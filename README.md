@@ -651,6 +651,57 @@ first message of every session and again after each compaction.
   each beside the input or, as in the tool, beside its folder. `--no-auto-context`
   turns this off.
 
+## Correction mode
+
+`--drafts <path>` starts a fresh run from the units another run stored, and the
+agent corrects them instead of working the units from scratch. The path is a
+`chronotranscriber.sqlite` (for `transcribe`) or a `chronominer.sqlite` (for
+`extract`), or an output root that holds one:
+
+```bash
+mabillon transcribe book.pdf --drafts ct_out/ --out corrected/
+mabillon extract prices.txt --schema PriceListEntries --drafts prices_cm/chronominer.sqlite
+```
+
+The store document is found by its recorded input path, compared without case on
+Windows and macOS; for an image folder in extraction, each image has its own
+ChronoMiner document. The input hash the store recorded must be that of the
+current input (a document without one is accepted with a warning, as
+ChronoTranscriber does), and when several documents have the same input,
+`--drafts-document <name>` chooses one of them; inputs with a single document keep
+it. A ChronoTranscriber document of native PDF text has no pages and is refused.
+Mabillon reads the store through the tools' views (`page_text`, `chunks`) and
+never writes to it, unless it is also the run's output store.
+
+In transcription, each page that is done, not stale and of outcome `ok` seeds its
+unit file: the stored text below a front matter whose required fields are empty,
+for an image folder only when the stored page names the unit's image. In
+extraction, each done chunk seeds its unit with its stored answer; for a text,
+ChronoMiner's chunk ranges become Mabillon's units, counted on ChronoMiner's lines
+(trailing blank lines included), and a range the text cannot hold is refused.
+Units without a draft, and units whose draft is empty or not a JSON object (with a
+warning), are worked from scratch, and their unit message says so. The seeded
+files are written once the output store has accepted the document, with a copy of
+each draft in `run/drafts/`.
+
+The system prompt then asks the agent to correct an erroneous transcription or
+extraction, and the message of a seeded unit names its unit file as holding one
+that contains errors, without repeating its content. Without `--drafts` the prompt
+is the one of an ordinary run. When the drafts store is also the output store, the
+drafted units are worked again rather than adopted, and `--force` is refused,
+since it would reset the drafts (drop the documents with the tool, or write to a
+separate `--out`). In correction mode a done row of the output store is replaced
+only by a unit that commits; a correction closed for review leaves the stored row
+as it was and is reported in the state and sidecar only. A page whose stored image
+name does not match is worked from scratch and not adopted. Done units without a draft
+are adopted as in any run. A corrected unit whose row another tool replaces later
+is corrected again from its draft on the next run, never adopted. The state
+and every page or unit record of the sidecar note the draft's store, document,
+tool, run and the SHA-256 of the seeded file under `draft`, and the experiment
+settings record `correction: true`, so a resume needs `--drafts` again. Converted
+inputs (HTML, DOCX, EPUB) cannot take drafts, since their stored input is the
+converted text of another run.
+
 ## Use from Claude Code and other agents
 
 Mabillon runs headless, like `codex exec`: it never prompts, prints one

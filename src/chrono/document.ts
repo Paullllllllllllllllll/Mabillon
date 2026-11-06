@@ -336,7 +336,7 @@ function readCanonical(paths: DocPaths, mode: Mode, unit: UnitRecord): string | 
 }
 
 /** A JSON object in a model answer (as ChronoMiner's `parse_json_object` finds it, without the salvage step). */
-function parseAnswer(text: string): Record<string, unknown> | undefined {
+export function parseAnswer(text: string): Record<string, unknown> | undefined {
 	const candidates = [text.trim()];
 	const fence = /^```[^\n]*\n([\s\S]*?)\n\s*```\s*$/.exec(text.trim());
 	if (fence) candidates.push(fence[1]);
@@ -531,7 +531,7 @@ export class ChronoSync {
 		const current = identity();
 		if (row.units_total > 0 && row.input_sha256 && row.input_sha256 !== current) {
 			throw new Error(
-				`the store document '${document.name}' in ${path} holds another input (stored ${row.input_sha256.slice(0, 12)}..., now ${current.slice(0, 12)}...); use --force to start it over`,
+				`the store document '${document.name}' in ${path} holds another input (stored ${row.input_sha256.slice(0, 12)}..., now ${current.slice(0, 12)}...); use --force to start it over, or write to another --out`,
 			);
 		}
 		this.checkSchema(connection, row, document, path);
@@ -554,7 +554,7 @@ export class ChronoSync {
 		);
 		if (stored && stored !== this.currentSchemaSha() && done > 0) {
 			throw new Error(
-				`the store document '${document.name}' in ${path} has ${done} chunk(s) extracted with another schema (stored ${stored.slice(0, 12)}..., now ${this.currentSchemaSha().slice(0, 12)}...); use --force to extract it again`,
+				`the store document '${document.name}' in ${path} has ${done} chunk(s) extracted with another schema (stored ${stored.slice(0, 12)}..., now ${this.currentSchemaSha().slice(0, 12)}...); use --force to extract it again, or write to another --out`,
 			);
 		}
 	}
@@ -707,7 +707,9 @@ export class ChronoSync {
 		const all = c.all("SELECT * FROM units WHERE doc_id = ? ORDER BY kind, idx", docId) as unknown as UnitRow[];
 		const problem = layoutProblem(this.plan.tool, all, kind, planned, document);
 		if (problem) {
-			throw new Error(`the store document '${document.name}' ${problem}; use --force to replace its units`);
+			throw new Error(
+				`the store document '${document.name}' ${problem}; use --force to replace its units, or write to another --out`,
+			);
 		}
 		recordIdentity(c, docId, identity);
 		planUnits(c, docId, kind, planned, stamp);
@@ -720,7 +722,11 @@ export class ChronoSync {
 		const values: Record<string, unknown> = {
 			schema_name: this.options.schema.name,
 			model_name: model,
-			chunking_method: text ? (state.fingerprint.lineRanges ? "line_ranges" : "mabillon") : "pages",
+			chunking_method: text
+				? state.fingerprint.lineRanges || state.drafts?.ranges
+					? "line_ranges"
+					: "mabillon"
+				: "pages",
 			chunking_text_version: null,
 			document_total_chunks: text ? held.units.length : null,
 			chunk_slice: this.options.units ? { pages: this.options.units } : null,
@@ -751,11 +757,25 @@ export class ChronoSync {
 			const usable = row.status === "done" && row.stale !== 1 && row.content !== null && row.tool !== "mabillon";
 			const seen = unit.storeRow;
 			const now = baseline(row);
+			const changed =
+				seen !== undefined && (seen.runId !== now.runId || seen.status !== now.status || seen.stale !== now.stale);
 			unit.storeRow = now;
+			// Correction mode: a drafted unit whose row changed since Mabillon last saw it (also one --redo-review set
+			// to pending) is corrected again from its saved draft, never adopted.
+			if (unit.draft && changed) {
+				if (unit.status !== "pending") reopenUnit(unit);
+				restoreDraft(paths, state, unit);
+				continue;
+			}
+			// A drafted unit is worked by the agent, also when its draft is this store's done row, and so is one whose
+			// draft could not be read or matched.
+			if ((unit.draft || unit.draftRejected) && unit.status === "pending") continue;
 			if (seen !== undefined && !unit.adopted && unit.status !== "pending") {
 				if (seen.runId === now.runId && seen.status === now.status && seen.stale === now.stale) continue;
-				if (!usable) {
+				// A corrected unit is never replaced by another tool's row: it is corrected again from its draft.
+				if (!usable || unit.draft) {
 					reopenUnit(unit);
+					if (unit.draft) restoreDraft(paths, state, unit);
 					continue;
 				}
 			} else if (unit.adopted && !usable) {
@@ -914,6 +934,9 @@ export class ChronoSync {
 			const row = rows.get(item.planned.idx);
 			const want = this.desired(state, paths, held, item);
 			if (want === undefined) continue;
+			// Correction mode: a done row of the output store (a draft, or another tool's or document's work) is
+			// replaced only by a unit that commits; a failed attempt is reported in the state and the sidecar only.
+			if (state.drafts && item.unit.status !== "committed" && row?.status === "done") continue;
 			if (want === "pending") {
 				if (row && row.tool === "mabillon" && row.status !== "pending") {
 					c.run(
@@ -1007,6 +1030,12 @@ function registeredOwner(
 	return undefined;
 }
 
+/** Correction mode: put the seeded draft (its immutable copy in run/drafts/) back into the unit file. */
+function restoreDraft(paths: DocPaths, state: DocState, unit: UnitRecord): void {
+	const copy = join(paths.runDir, "drafts", unitFile(state.mode, unit));
+	if (existsSync(copy)) writeFileAtomic(join(paths.workDir, unitFile(state.mode, unit)), readFileSync(copy, "utf8"));
+}
+
 /** A finished unit that the store no longer holds as done goes back to pending (its committed copy is ignored). */
 function reopenUnit(unit: UnitRecord): void {
 	// The fields reopenDamaged and --redo-review reset, so the new attempt starts with no stops or cap records.
@@ -1090,11 +1119,7 @@ function layoutProblem(
 			const label = row.label ?? "";
 			const image = basename(images[row.idx] ?? "");
 			const known = label.endsWith("_pre_processed.jpg") || label.includes("_tess_preprocessed.");
-			const stem = pyStem(image);
-			const fits =
-				label === `${image}_pre_processed.jpg` ||
-				label.startsWith(`${stem}_tess_preprocessed.`) ||
-				label.startsWith(`${image}_tess_preprocessed.`);
+			const fits = labelNamesImage(label, image);
 			if (known && !fits) return `stores page ${row.idx + 1} as ${label}, which is not ${image}`;
 		}
 	}
@@ -1125,7 +1150,7 @@ function jsonText(value: Record<string, unknown>): string {
  * Required fields the store has no value for (such as `image_analysis`) get the empty value of their type, so the
  * page validates.
  */
-function adoptedTranscription(content: string, schema: LoadedSchema): string {
+export function adoptedTranscription(content: string, schema: LoadedSchema): string {
 	const properties = (schema.schema.properties ?? {}) as Record<string, { type?: string | string[] }>;
 	const cause = detectCause(content);
 	const flags: string[] = [];
@@ -1149,9 +1174,20 @@ function adoptedTranscription(content: string, schema: LoadedSchema): string {
 }
 
 /** A unit file for a chunk another tool extracted: its answer's JSON object, indented. */
-function adoptedExtraction(content: string): string {
+export function adoptedExtraction(content: string): string {
 	const data = parseAnswer(content);
 	return data ? `${JSON.stringify(data, null, 2)}\n` : content;
+}
+
+/** Whether a ChronoTranscriber page label (`<image>_pre_processed.jpg`, tesseract variants) names `image`. */
+export function labelNamesImage(label: string, image: string): boolean {
+	const name = basename(image);
+	const stem = pyStem(name);
+	return (
+		label === `${name}_pre_processed.jpg` ||
+		label.startsWith(`${stem}_tess_preprocessed.`) ||
+		label.startsWith(`${name}_tess_preprocessed.`)
+	);
 }
 
 /**

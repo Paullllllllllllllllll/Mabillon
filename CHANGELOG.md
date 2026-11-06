@@ -36,7 +36,17 @@
   with its converted text, `<stem>.txt`, as input; a multi-page TIFF is refused
   for extraction. `test/interop/check.py` checks the outputs with the tools' own
   code. Earlier runs are neither resumed nor converted: a document whose earlier
-  run state is still in place stops with a message naming the folder.
+  run state is still in place stops with a message naming the folder. New
+  correction mode: `--drafts` takes a `chronotranscriber.sqlite` or
+  `chronominer.sqlite` (or an output root with it), finds the store document of
+  each input by its recorded input path and hash (`--drafts-document` chooses
+  among several), and seeds the unit files of a fresh run with the stored pages
+  or answers, which the agent then corrects; ChronoMiner's chunk ranges become the
+  units of a text. The prompt and the unit messages say so only in this mode, the
+  store is read through the tools' views and written only when it is also the
+  output store, where the drafted units are worked again instead of adopted, and
+  the state and sidecar record each unit's draft (store, document, tool, run,
+  SHA-256).
 - **v0.9.1** (31 October 2026) -- First public release. The bundled extraction
   schemas are now ChronoMiner's eight example schemas (`PriceListEntries`,
   `BibliographicCatalogueEntries` and others); the earlier project schemas and their

@@ -199,6 +199,17 @@ function runInfo(unit: UnitRecord): Record<string, unknown> {
 		...(unit.hardCapClosed ? { hard_cap_closed: true } : {}),
 		...(unit.softCapBlocks ? { soft_cap_blocks: unit.softCapBlocks } : {}),
 		...(unit.adopted ? { adopted_from: { tool: unit.adopted.tool, run_id: unit.adopted.runId } } : {}),
+		...(unit.draft
+			? {
+					draft: {
+						store: unit.draft.store,
+						document: unit.draft.document,
+						tool: unit.draft.tool,
+						run_id: unit.draft.runId,
+						sha256: unit.draft.sha256,
+					},
+				}
+			: {}),
 	};
 }
 

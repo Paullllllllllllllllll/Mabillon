@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
@@ -23,6 +24,7 @@ import {
 	say,
 	sidecarFile,
 	tempDir,
+	workingDir,
 } from "./helpers.ts";
 
 /**
@@ -158,6 +160,7 @@ async function harness(responder: (context: TranscriptContext) => AssistantMessa
 	const logs: string[] = [];
 	return {
 		logs,
+		requests: faux.requests,
 		run: (mode: "transcribe" | "extract", inputs: string[]) =>
 			run({
 				mode,
@@ -560,6 +563,370 @@ describe("ChronoMiner rows Mabillon adopts", () => {
 	}, 120_000);
 });
 
+/** What the model was shown: the system prompt and, per unit, the text of the user messages that named it. */
+function shown(requests: TranscriptContext[]): { system: string; units: Record<string, string> } {
+	// A unit is delivered in a user message or in the result of the commit before it.
+	const units: Record<string, string> = {};
+	const seen = new Set<string>();
+	for (const request of requests) {
+		for (const message of request.messages) {
+			if (message.role !== "user" && message.role !== "toolResult") continue;
+			const text = messageText(message);
+			const unit = [...text.matchAll(/Current unit: ([pc]\d+)/g)].pop()?.[1];
+			if (!unit || seen.has(text)) continue;
+			seen.add(text);
+			units[unit] = `${units[unit] ?? ""}\n${text}`;
+		}
+	}
+	return { system: JSON.stringify(requests[0] ?? {}), units };
+}
+
+const DRAFT_NOTE = /holds (a transcription|an extraction) of this (page|chunk) that contains errors/;
+
+describe("correction mode", () => {
+	it("corrects the pages ChronoTranscriber transcribed of an image folder, from another store", async () => {
+		const root = tempDir();
+		const folder = await makeImageFolder(join(root, "in", "scans"), 5);
+		const drafts = join(root, "drafts");
+		mkdirSync(drafts);
+		writeCtDocument(realPath(drafts), "scans", realPath(folder), [
+			{ status: "done", content: "Take spinach, errrors here.", label: "scan_1.png_pre_processed.jpg" },
+			// Not seeded: marked stale, of another image, without an image name, empty (with a warning).
+			{ status: "done", content: "Stale page.", label: "scan_2.png_pre_processed.jpg", stale: 1 },
+			{ status: "done", content: "Not this folder's page.", label: "scan_9.png_pre_processed.jpg" },
+			{ status: "done", content: "No image name.", label: null, sourceIndex: 3 },
+			{ status: "done", content: "  ", label: "scan_5.png_pre_processed.jpg" },
+		]);
+		const database = join(realPath(drafts), "chronotranscriber.sqlite");
+		const before = readFileSync(database);
+		const out = join(root, "out");
+		let seeded = "";
+		const inner = transcriber();
+		const h = await harness(
+			(context) => {
+				const unit = currentUnit(context);
+				if (unit === "p0001" && !seeded) {
+					seeded = readFileSync(join(workingDir(out, "scans"), "work", "units", "p0001.md"), "utf8");
+				}
+				return inner(context);
+			},
+			{ out, drafts },
+		);
+		const summary = await h.run("transcribe", [folder]);
+		expect(summary.documents[0]).toMatchObject({ committed: 5, pending: 0 });
+		expect(summary.documents[0].warnings?.some((warning) => /p0005: the draft is empty/.test(warning))).toBe(true);
+		// The seeded file: the schema's front matter (required fields empty) and the stored text as its body.
+		expect(seeded).toMatch(/^---\n[\s\S]*image_analysis: ""[\s\S]*---\nTake spinach, errrors here\.\n$/);
+		const { system, units } = shown(h.requests);
+		expect(system).toContain("correct an erroneous transcription of each page");
+		expect(system).toContain("Unless the unit message says otherwise");
+		expect(units.p0001).toMatch(DRAFT_NOTE);
+		expect(units.p0001).not.toContain("errrors");
+		for (const unit of ["p0002", "p0003", "p0004", "p0005"]) {
+			expect(units[unit]).not.toMatch(DRAFT_NOTE);
+			expect(units[unit]).toContain("There is no draft for this unit");
+		}
+		const state = JSON.parse(readFileSync(join(workingDir(out, "scans"), "run", "state.json"), "utf8"));
+		expect(state.units[0].draft).toMatchObject({
+			store: database,
+			document: "scans",
+			tool: "chronotranscriber",
+			runId: "ct-run",
+		});
+		expect(state.units[0].draft.sha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(state.units.slice(1).map((unit: { draft?: unknown }) => unit.draft)).toEqual([
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+		]);
+		expect(state.warnings).toEqual(expect.arrayContaining([expect.stringMatching(/p0005: the draft is empty/)]));
+		expect(state.experiment.settings.correction).toBe(true);
+		expect(readSidecar(out, "scans").pages[0].draft).toMatchObject({ document: "scans", run_id: "ct-run" });
+		// The drafts store is read, never written; the seeded draft keeps an immutable copy in run/drafts/.
+		expect(readFileSync(database).equals(before)).toBe(true);
+		expect(readFileSync(join(workingDir(out, "scans"), "run", "drafts", "units", "p0001.md"), "utf8")).toBe(seeded);
+		// Another tool replaces the corrected page's row in the output store: the resume corrects it again from its
+		// draft instead of adopting that row.
+		const output = new Connection(join(realPath(out), "chronotranscriber.sqlite"));
+		output.run("INSERT INTO runs (run_id, tool, started_at) VALUES ('ct-later', 'chronotranscriber', 'x')");
+		output.run(
+			"UPDATE units SET tool = 'chronotranscriber', run_id = 'ct-later', content = 'Later text.' WHERE idx = 0",
+		);
+		output.close();
+		const again: string[] = [];
+		const resumed = await (
+			await harness(
+				(context) => {
+					const unit = currentUnit(context);
+					if (unit && !again.includes(unit)) again.push(unit);
+					return inner(context);
+				},
+				{ out, drafts },
+			)
+		).run("transcribe", [folder]);
+		expect(resumed.documents[0]).toMatchObject({ committed: 5, pending: 0 });
+		expect(again).toEqual(["p0001"]);
+		const resumedState = JSON.parse(readFileSync(join(workingDir(out, "scans"), "run", "state.json"), "utf8"));
+		expect(resumedState.units[0].adopted).toBeUndefined();
+		expect(query(join(realPath(out), "chronotranscriber.sqlite"), "SELECT tool FROM units WHERE idx = 0")).toEqual([
+			{ tool: "mabillon" },
+		]);
+	}, 120_000);
+
+	it("corrects a PDF in place, replacing the drafted rows, and refuses ambiguous or changed drafts", async () => {
+		const dir = scenarioDir("ct-correct-inplace");
+		mkdirSync(join(dir, "in"), { recursive: true });
+		const pdf = makePdf(join(dir, "in", "receipts.pdf"), ["First page", "Second page"]);
+		const root = realPath(join(dir, "in"));
+		const page = (n: number) => ({
+			status: "done",
+			content: `Draft of page ${n}.`,
+			label: `page_000${n}_pre_processed.jpg`,
+			sourceIndex: n - 1,
+		});
+		writeCtDocument(root, "receipts", realPath(pdf), [page(1), page(2)], { kind: "pdf" });
+		const worked: string[] = [];
+		// The correction of page 2 is closed for review.
+		const inner = transcriber({ stop: ["p0002"] });
+		const h = await harness(
+			(context) => {
+				const unit = currentUnit(context);
+				if (unit && !worked.includes(unit)) worked.push(unit);
+				return inner(context);
+			},
+			{ drafts: root, dpi: 72 },
+		);
+		const summary = await h.run("transcribe", [pdf]);
+		expect(summary.documents[0]).toMatchObject({ committed: 1, needsReview: 1, pending: 0 });
+		// The drafted pages are worked, not adopted. The committed correction replaces its row; the failed one
+		// leaves the stored draft as it was, and is reported in the sidecar only.
+		expect(worked).toEqual(["p0001", "p0002"]);
+		const database = join(root, "chronotranscriber.sqlite");
+		expect(query(database, "SELECT tool, status, content FROM units ORDER BY idx")).toEqual([
+			{ tool: "mabillon", status: "done", content: expect.stringContaining("Take ſpinage for p0001") },
+			{ tool: "chronotranscriber", status: "done", content: "Draft of page 2." },
+		]);
+		expect(readSidecar(root, "receipts").pages[1]).toMatchObject({ status: "needs_review" });
+		// --force would reset the drafts of the output store before the correction.
+		await expect(
+			(await harness(transcriber(), { drafts: root, dpi: 72, force: true })).run("transcribe", [pdf]),
+		).rejects.toThrow(/--force would reset the drafts .*drop the documents/);
+		expect(readSidecar(root, "receipts").mabillon.units_adopted ?? 0).toBe(0);
+		describeScenario(dir, {
+			tool: "chronotranscriber",
+			mode: "transcribe",
+			input: realPath(pdf),
+			output: null,
+			formats: ["txt"],
+			expect: { receipts: "complete" },
+		});
+		// Two documents of the same input need --drafts-document; a document of another version is refused.
+		const other = tempDir();
+		const twice = join(other, "drafts");
+		mkdirSync(twice);
+		writeCtDocument(realPath(twice), "receipts", realPath(pdf), [page(1)], { kind: "pdf" });
+		writeCtDocument(realPath(twice), "copy", realPath(pdf), [page(1)], { kind: "pdf", docId: 2 });
+		const ambiguous = await (await harness(transcriber(), { out: join(other, "a"), drafts: twice, dpi: 72 })).run(
+			"transcribe",
+			[pdf],
+		);
+		expect(ambiguous.documents[0].error).toMatch(
+			/several documents .*: copy, receipts; choose one with --drafts-document/,
+		);
+		const chosen = await (
+			await harness(transcriber(), { out: join(other, "b"), drafts: twice, draftsDocument: "copy", dpi: 72 })
+		).run("transcribe", [pdf]);
+		expect(chosen.documents[0].error).toBeUndefined();
+		const stale = join(other, "stale");
+		mkdirSync(stale);
+		writeCtDocument(realPath(stale), "receipts", realPath(pdf), [page(1)], { kind: "pdf", sha256: "0".repeat(64) });
+		const changed = await (await harness(transcriber(), { out: join(other, "c"), drafts: stale, dpi: 72 })).run(
+			"transcribe",
+			[pdf],
+		);
+		expect(changed.documents[0].error).toMatch(/was made from another version of/);
+		// ChronoTranscriber's native PDF text has no pages to seed.
+		const native = join(other, "native");
+		mkdirSync(native);
+		writeCtDocument(realPath(native), "receipts", realPath(pdf), [page(1)], { kind: "pdf", unitKind: "text" });
+		const refused = await (await harness(transcriber(), { out: join(other, "d"), drafts: native, dpi: 72 })).run(
+			"transcribe",
+			[pdf],
+		);
+		expect(refused.documents[0].error).toMatch(/native PDF text .*cannot seed pages/);
+		const extract = await harness(extractor(), { drafts: twice, schema: writePriceSchema(other) });
+		await expect(extract.run("extract", [pdf])).rejects.toThrow(
+			/extract takes its drafts from a chronominer\.sqlite/,
+		);
+	}, 120_000);
+
+	it("keeps the stored rows of unmatched and failed corrections, and corrects a changed row again from its draft", async () => {
+		const root = tempDir();
+		const folder = await makeImageFolder(join(root, "scans"), 2);
+		writeCtDocument(realPath(root), "scans", realPath(folder), [
+			{ status: "done", content: "Page without an image name.", label: null, sourceIndex: 0 },
+			{ status: "done", content: "Draft of scan 2.", label: "scan_2.png_pre_processed.jpg" },
+		]);
+		const database = join(realPath(root), "chronotranscriber.sqlite");
+		const worked: string[] = [];
+		const record = (inner: (context: TranscriptContext) => AssistantMessage) => (context: TranscriptContext) => {
+			const unit = currentUnit(context);
+			if (unit && !worked.includes(unit)) worked.push(unit);
+			return inner(context);
+		};
+		// Both attempts are closed for review: the unmatched page is worked from scratch, not adopted, and neither
+		// stored row is replaced.
+		const first = await (
+			await harness(record(transcriber({ stop: ["p0001", "p0002"] })), { drafts: root, settleRetries: 0 })
+		).run("transcribe", [folder]);
+		expect(first.documents[0]).toMatchObject({ committed: 0, needsReview: 2 });
+		expect(worked).toEqual(["p0001", "p0002"]);
+		expect(
+			first.documents[0].warnings?.some((warning) =>
+				/p0001: the stored page does not name scan_1\.png/.test(warning),
+			),
+		).toBe(true);
+		expect(query(database, "SELECT tool, content FROM units ORDER BY idx")).toEqual([
+			{ tool: "chronotranscriber", content: "Page without an image name." },
+			{ tool: "chronotranscriber", content: "Draft of scan 2." },
+		]);
+		// Another tool changes page 2; --redo-review corrects it again from the saved draft.
+		const connection = new Connection(database);
+		connection.run("INSERT INTO runs (run_id, tool, started_at) VALUES ('ct-later', 'chronotranscriber', 'x')");
+		connection.run("UPDATE units SET run_id = 'ct-later', content = 'Later text.' WHERE idx = 1");
+		connection.close();
+		const h = await harness(record(transcriber()), { drafts: root, redoReview: true });
+		const second = await h.run("transcribe", [folder]);
+		expect(second.documents[0]).toMatchObject({ committed: 2, pending: 0 });
+		expect(shown(h.requests).units.p0002).toMatch(DRAFT_NOTE);
+		expect(query(database, "SELECT tool FROM units ORDER BY idx")).toEqual([
+			{ tool: "mabillon" },
+			{ tool: "mabillon" },
+		]);
+	}, 120_000);
+
+	it("takes ChronoMiner's chunk ranges as the units of a text and corrects them in place", async () => {
+		const dir = scenarioDir("cm-correct-ranges");
+		mkdirSync(join(dir, "in"), { recursive: true });
+		const text = join(dir, "in", "prices.md");
+		// The trailing blank line is line 40 for ChronoMiner, and its last chunk ends there.
+		writeFileSync(text, `${RECIPES_TEXT}\n\n`);
+		const root = realPath(join(dir, "in"));
+		const answer = (n: number) =>
+			JSON.stringify({
+				contains_no_content_of_requested_type: false,
+				entries: [{ item: `Pepper ${n}`, price: { amount: n, currency: "fl" }, tags: [], page: 1, checked: false }],
+			});
+		const ranges = ["1-10", "11-25", "26-40"];
+		writeStoreDocument(
+			"chronominer",
+			root,
+			"prices",
+			realPath(text),
+			[
+				{ status: "done", content: answer(1), label: ranges[0] },
+				{ status: "done", content: "not a JSON answer", label: ranges[1] },
+				{ status: "done", content: answer(3), label: ranges[2] },
+			],
+			{ kind: "text", sha256: null },
+		);
+		const schema = writePriceSchema(dir);
+		const h = await harness(extractor(), { drafts: root, schema, chunkTokens: 100, formats: ["json", "csv"] });
+		const summary = await h.run("extract", [text]);
+		const doc = summary.documents[0];
+		expect(doc.error).toBeUndefined();
+		expect(doc).toMatchObject({ units: 3, committed: 3 });
+		expect(doc.warnings?.some((warning) => /records no input hash/.test(warning))).toBe(true);
+		expect(doc.warnings?.some((warning) => /c0002: the draft is no JSON object/.test(warning))).toBe(true);
+		const { system, units } = shown(h.requests);
+		expect(system).toContain("correct an erroneous extraction of each chunk");
+		expect(Object.keys(units)).toEqual(["c0001", "c0002", "c0003"]);
+		expect(units.c0001).toMatch(DRAFT_NOTE);
+		expect(units.c0002).not.toMatch(DRAFT_NOTE);
+		const database = join(root, "chronominer.sqlite");
+		expect(query(database, "SELECT source_index, tool FROM units ORDER BY idx")).toEqual(
+			ranges.map((range) => ({ source_index: range, tool: "mabillon" })),
+		);
+		const meta = JSON.parse(readFileSync(join(root, "prices_output.json"), "utf8"))._chronominer_metadata;
+		expect(meta.chunking_method).toBe("line_ranges");
+		describeScenario(dir, {
+			tool: "chronominer",
+			mode: "extract",
+			input: realPath(text),
+			output: root,
+			schema,
+			formats: ["json", "csv"],
+			expect: { prices: "complete" },
+		});
+		// A chunk range the text cannot hold is refused, not clipped.
+		const short = join(dir, "short");
+		mkdirSync(short);
+		const shortText = join(short, "prices.md");
+		writeFileSync(shortText, "One line.\n");
+		writeStoreDocument(
+			"chronominer",
+			realPath(short),
+			"prices",
+			realPath(shortText),
+			[{ status: "done", content: answer(1), label: "1-2" }],
+			{ kind: "text" },
+		);
+		const clipped = await (await harness(extractor(), { drafts: short, schema, out: join(dir, "short-out") })).run(
+			"extract",
+			[shortText],
+		);
+		expect(clipped.documents[0].error).toMatch(/chunk 1-2 lies outside the 1 lines of prices\.md/);
+	}, 120_000);
+
+	it("seeds the pages of an image folder from ChronoMiner's documents of its images", async () => {
+		const root = tempDir();
+		const folder = await makeImageFolder(join(root, "in", "ledger"), 3);
+		const drafts = join(root, "drafts");
+		mkdirSync(drafts);
+		const answer = (item: string) =>
+			JSON.stringify({
+				contains_no_content_of_requested_type: false,
+				entries: [{ item, price: { amount: 1, currency: "fl" }, tags: [], page: 1, checked: false }],
+			});
+		const image = (n: number) => join(realPath(folder), `scan_${n}.png`);
+		const chunk = (item: string, n: number) => [
+			{ status: "done", content: answer(item), label: `scan_${n}.png`, sourceIndex: `scan_${n}.png` },
+		];
+		// scan_1 has two documents, scan_2 one, scan_3 none.
+		writeStoreDocument("chronominer", realPath(drafts), "scan_1", image(1), chunk("first", 1), { kind: "image" });
+		writeStoreDocument("chronominer", realPath(drafts), "scan_1_copy", image(1), chunk("copy", 1), {
+			kind: "image",
+			docId: 2,
+		});
+		writeStoreDocument("chronominer", realPath(drafts), "scan_2", image(2), chunk("second", 2), {
+			kind: "image",
+			docId: 3,
+		});
+		const schema = writePriceSchema(root);
+		const ambiguous = await (await harness(extractor(), { out: join(root, "a"), drafts, schema })).run("extract", [
+			folder,
+		]);
+		expect(ambiguous.documents[0].error).toMatch(/several documents .*scan_1\.png: scan_1, scan_1_copy/);
+		const out = join(root, "out");
+		// The selector decides for scan_1 only; scan_2 keeps its own document.
+		const h = await harness(extractor(), { out, drafts, schema, draftsDocument: "scan_1_copy" });
+		const summary = await h.run("extract", [folder]);
+		expect(summary.documents[0]).toMatchObject({ committed: 3, pending: 0 });
+		const { units } = shown(h.requests);
+		expect(units.p0001).toMatch(DRAFT_NOTE);
+		expect(units.p0002).toMatch(DRAFT_NOTE);
+		expect(units.p0003).toContain("There is no draft for this unit");
+		const state = JSON.parse(readFileSync(join(workingDir(out, "ledger"), "run", "state.json"), "utf8"));
+		expect(state.units.map((unit: { draft?: { document: string } }) => unit.draft?.document)).toEqual([
+			"scan_1_copy",
+			"scan_2",
+			undefined,
+		]);
+		expect(state.units[0].draft).toMatchObject({ tool: "chronominer", runId: "cm-run" });
+	}, 120_000);
+});
+
 describe("working state and refusals before agent work", () => {
 	it("keeps a transcription and the extraction of its text apart", async () => {
 		const root = tempDir();
@@ -731,38 +1098,88 @@ function writeCtDocument(
 	root: string,
 	name: string,
 	input: string,
-	units: Array<{ status: string; content: string | null; label: string }>,
+	units: Array<{
+		status: string;
+		content: string | null;
+		label: string | null;
+		sourceIndex?: number | string;
+		stale?: number;
+	}>,
+	options: { docId?: number; kind?: string; sha256?: string | null; unitKind?: string } = {},
 ) {
-	const store = ChronoStore.open(root, "chronotranscriber", { command: "x", toolVersion: "0", spec: {} });
+	writeStoreDocument("chronotranscriber", root, name, input, units, options);
+}
+
+/** A store document as ChronoTranscriber or ChronoMiner writes it (units of kind page or chunk, run ct-run/cm-run). */
+function writeStoreDocument(
+	tool: "chronotranscriber" | "chronominer",
+	root: string,
+	name: string,
+	input: string,
+	units: Array<{
+		status: string;
+		content: string | null;
+		label: string | null;
+		sourceIndex?: number | string;
+		stale?: number;
+	}>,
+	options: { docId?: number; kind?: string; sha256?: string | null; unitKind?: string } = {},
+) {
+	const store = ChronoStore.open(root, tool, { command: "x", toolVersion: "0", spec: {} });
 	store.close(undefined);
-	const connection = new Connection(join(root, "chronotranscriber.sqlite"));
+	const connection = new Connection(join(root, `${tool}.sqlite`));
+	const run = tool === "chronotranscriber" ? "ct-run" : "cm-run";
+	const docId = options.docId ?? 1;
+	const sha =
+		options.sha256 === undefined
+			? tool === "chronotranscriber"
+				? inputIdentity(input)
+				: fileSha(input)
+			: options.sha256;
 	try {
 		connection.transaction((c) => {
 			c.run(
-				"INSERT INTO runs (run_id, tool, tool_version, command, started_at) VALUES ('ct-run', 'chronotranscriber', '1.3.1', 'transcribe', '2026-11-01T00:00:00.000+00:00')",
+				"INSERT OR IGNORE INTO runs (run_id, tool, tool_version, command, started_at) VALUES (?, ?, '1.3.1', ?, '2026-11-01T00:00:00.000+00:00')",
+				run,
+				tool,
+				tool === "chronotranscriber" ? "transcribe" : "extract",
 			);
 			c.run(
-				"INSERT INTO documents (doc_id, name, tool, input_path, input_sha256, kind, first_run_id, last_run_id) VALUES (1, ?, 'chronotranscriber', ?, ?, 'images', 'ct-run', 'ct-run')",
+				"INSERT INTO documents (doc_id, name, tool, input_path, input_sha256, kind, first_run_id, last_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				docId,
 				name,
+				tool,
 				input,
-				inputIdentity(input),
+				sha,
+				options.kind ?? "images",
+				run,
+				run,
 			);
 			units.forEach((unit, idx) => {
 				c.run(
-					"INSERT INTO units (doc_id, kind, idx, status, outcome, source_index, label, content, tool, model, provider, run_id, attempts, updated_at) VALUES (1, 'page', ?, ?, ?, ?, ?, ?, 'chronotranscriber', 'gpt-6-luna', 'openai', 'ct-run', 1, '2026-11-01T00:00:00.000+00:00')",
+					"INSERT INTO units (doc_id, kind, idx, status, outcome, source_index, label, content, tool, model, provider, run_id, attempts, stale, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'gpt-6-luna', 'openai', ?, 1, ?, '2026-11-01T00:00:00.000+00:00')",
+					docId,
+					options.unitKind ?? (tool === "chronotranscriber" ? "page" : "chunk"),
 					idx,
 					unit.status,
 					unit.status === "done" ? "ok" : unit.status === "failed" ? "failed" : null,
-					unit.label,
+					unit.sourceIndex ?? unit.label,
 					unit.label,
 					unit.content,
+					tool,
+					run,
+					unit.stale ?? 0,
 				);
 			});
-			refreshDocument(c, 1, "ct-run");
+			refreshDocument(c, docId, run);
 		});
 	} finally {
 		connection.close();
 	}
+}
+
+function fileSha(path: string): string {
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 describe("mixed stores and refusals", () => {

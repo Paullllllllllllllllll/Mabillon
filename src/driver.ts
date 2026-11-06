@@ -51,8 +51,9 @@ import {
 	type StoreRegistry,
 	staleError,
 } from "./chrono/document.ts";
+import { type DraftsStore, findDrafts, rangesText, resolveDrafts, seedDrafts } from "./chrono/drafts.ts";
 import { realPath } from "./chrono/paths.ts";
-import { ChronoStore } from "./chrono/store.ts";
+import { ChronoStore, DATABASE_NAMES } from "./chrono/store.ts";
 import {
 	type ChronoConfig,
 	checkToolSet,
@@ -287,32 +288,50 @@ async function convertText(
 	config: ChronoConfig,
 	warn: (message: string) => void,
 	log: (message: string) => void,
+	draftRanges?: Array<[number, number]>,
 ): Promise<{ chunks: TextChunk[]; lines: string[]; documentText: string; uncovered?: string[] }> {
 	const { text, warning } = await loadTextDocument(doc.path);
 	if (warning) warn(warning);
 	let { chunks, lines } = chunkText(text, config.chunkTokens);
+	if (draftRanges) {
+		// ChronoMiner's lines (`read_lines`): split at "\n", a final line end opens no line, trailing blank lines
+		// count. A chunk range outside them cannot be reproduced and is refused, not clipped.
+		lines = text === "" ? [] : text.split("\n");
+		if (text.endsWith("\n")) lines.pop();
+		const outside = draftRanges.find(([start, end]) => start < 1 || start > end || end > lines.length);
+		if (outside) {
+			throw new Error(
+				`the drafts document's chunk ${outside[0]}-${outside[1]} lies outside the ${lines.length} lines of ${basename(doc.path)}`,
+			);
+		}
+	}
 	checkLineLengths(lines, config.chunkTokens);
 	let uncovered: string[] | undefined;
 	// ChronoMiner line ranges (e.g. after its semantic boundary adjustment) apply to plain-text files, whose line
-	// numbering the conversion keeps.
-	const ranges = lineRangesFile(doc);
+	// numbering the conversion keeps; in correction mode the chunks of the drafts document take their place.
+	const file = lineRangesFile(doc);
+	const ranges = draftRanges
+		? { name: "the ChronoMiner chunks of the drafts document", text: rangesText(draftRanges) }
+		: file
+			? { name: basename(file), text: readFileSync(file, "utf8") }
+			: undefined;
 	if (ranges) {
-		const ranged = chunksFromLineRanges(lines, readFileSync(ranges, "utf8"));
+		const ranged = chunksFromLineRanges(lines, ranges.text);
 		if (ranged.length > 0) {
 			chunks = ranged;
-			log(`${doc.stem}: using ${ranged.length} line ranges from ${basename(ranges)}`);
+			log(`${doc.stem}: using ${ranged.length} line ranges from ${ranges.name}`);
 			const issues = lineRangeIssues(ranged, lines.length);
 			// Lines in no range would silently be left out of the extraction.
 			const gaps = issues.filter((issue) => issue.endsWith("in no range"));
 			if (gaps.length > 0 && !config.allowPartialRanges) {
 				throw new Error(
-					`${basename(ranges)} leaves source lines out (${gaps.join("; ")}); fix the ranges, or pass --allow-partial-ranges to extract only the covered lines`,
+					`${ranges.name} leaves source lines out (${gaps.join("; ")}); fix the ranges, or pass --allow-partial-ranges to extract only the covered lines`,
 				);
 			}
 			if (gaps.length > 0) uncovered = gaps;
-			for (const issue of issues) warn(`${basename(ranges)}: ${issue}`);
+			for (const issue of issues) warn(`${ranges.name}: ${issue}`);
 		} else {
-			warn(`${basename(ranges)} contains no line ranges; chunking automatically`);
+			warn(`${ranges.name} contains no line ranges; chunking automatically`);
 		}
 	}
 	return { chunks, lines, documentText: `${lines.join("\n")}\n`, uncovered };
@@ -324,7 +343,11 @@ async function convertText(
  */
 async function checkStoredText(doc: SourceDocument, config: ChronoConfig, paths: DocPaths, existing: DocState) {
 	const quiet = () => undefined;
-	const { chunks, documentText } = await convertText(doc, config, quiet, quiet);
+	// A correction run keeps the chunk ranges of its drafts document.
+	const draftRanges = existing.drafts?.ranges
+		? existing.units.map((unit): [number, number] => [unit.startLine ?? 0, unit.endLine ?? 0])
+		: undefined;
+	const { chunks, documentText } = await convertText(doc, config, quiet, quiet, draftRanges);
 	const refuse = (problem: string) => {
 		throw new Error(`Existing work cannot be resumed: ${problem}. Use --force to start over.`);
 	};
@@ -358,6 +381,7 @@ async function buildUnits(
 	fingerprint: SourceFingerprint,
 	warn: (message: string) => void,
 	log: (message: string) => void,
+	draftRanges?: Array<[number, number]>,
 ): Promise<{ units: UnitRecord[]; totalLines?: number; uncovered?: string[] }> {
 	if (doc.kind === "pdf" && pdf) {
 		const width = unitWidth(pdf.numPages);
@@ -403,7 +427,7 @@ async function buildUnits(
 			})),
 		};
 	}
-	const { chunks, lines, documentText, uncovered } = await convertText(doc, config, warn, log);
+	const { chunks, lines, documentText, uncovered } = await convertText(doc, config, warn, log, draftRanges);
 	fingerprint.text = sha256Text(documentText);
 	const textPath = documentTextPath(paths.runDir, basename(doc.path));
 	ensureDir(dirname(textPath));
@@ -1061,6 +1085,8 @@ function experimentRecord(
 		imageQuality: config.imageQuality,
 		maxImagePx: config.maxImagePx ?? null,
 		imageFallback: config.imageFallback,
+		// Correction mode is a different arm; the drafts themselves are recorded per unit.
+		...(config.drafts !== undefined ? { correction: true } : {}),
 		...(doc.kind === "pdf" ? { dpi: config.dpi, maxRenderPixels: config.maxRenderPixels } : {}),
 		...(inputKind === "text"
 			? { chunkTokens: config.chunkTokens, allowPartialRanges: config.allowPartialRanges }
@@ -1160,6 +1186,7 @@ async function processDocument(
 	notices: Set<string>,
 	plan: ChronoPlan,
 	registry: StoreRegistry,
+	draftsSource: DraftsStore | undefined,
 ): Promise<DocumentResult> {
 	const { config, log, mode } = options;
 	const paths = docPaths(plan.workingDir);
@@ -1237,6 +1264,8 @@ async function processDocument(
 		// The state is prepared here and becomes the document's state (exported at the end) only once the store
 		// accepted the document: a refused document changes neither its state nor its outputs.
 		let prepared: DocState;
+		/** Correction mode: the unit files to seed (new runs only). */
+		let seeded: Array<{ unit: UnitRecord; content: string }> = [];
 		if (existing) {
 			// Every compatibility check comes before any change to the state: a refused resume leaves the state and
 			// the outputs as they were (state stays undefined, so nothing is saved or exported).
@@ -1274,7 +1303,18 @@ async function processDocument(
 				warnings.push(message);
 				log(`${doc.stem}: ${message}`);
 			};
-			const built = await buildUnits(doc, paths, config, pdf, fingerprint, warn, log);
+			// Correction mode: the drafts are read before the units are built, since a ChronoMiner text document's
+			// chunk ranges become the units.
+			const drafts = draftsSource
+				? findDrafts(
+						draftsSource,
+						plan.tool === "chronominer"
+							? plan.documents.map((document) => document.image ?? realPath(doc.path))
+							: [realPath(doc.path)],
+						{ select: config.draftsDocument, warn },
+					)
+				: undefined;
+			const built = await buildUnits(doc, paths, config, pdf, fingerprint, warn, log, drafts?.[0].ranges);
 			if (built.units.length === 0) {
 				throw new Error(
 					doc.kind === "text"
@@ -1301,6 +1341,19 @@ async function processDocument(
 				updatedAt: now,
 			};
 			experiment = experimentRecord(doc, options, schema, inputKind, context, built.units.length);
+			if (drafts) {
+				seeded = seedDrafts(drafts, prepared, schema, warn);
+				prepared.drafts = {
+					store: drafts[0].database,
+					document: drafts.map((found) => found.document).join(", "),
+					...(drafts[0].ranges ? { ranges: true } : {}),
+				};
+				log(
+					`${doc.stem}: ${seeded.length} of ${prepared.units.length} unit(s) start from drafts of ${drafts[0].database}`,
+				);
+			}
+			// Warnings of the seeding (drafts that cannot be read) come after the state was made.
+			prepared.warnings = warnings.length > 0 ? warnings : undefined;
 		}
 		// The store documents: input identity, open batches, leases and chunk layout are checked, every unit is
 		// planned, and units another tool finished are adopted, before any agent work.
@@ -1308,6 +1361,14 @@ async function processDocument(
 			prompt: systemPromptFor(doc, options, schema, inputKind, context, prepared.units.length),
 			context: context.texts.map((text) => text.content),
 		});
+		// The seeded unit files are written only once the store accepted the document, with an immutable copy of
+		// each draft in run/drafts/ (the agent changes the one in work/).
+		for (const { unit, content } of seeded) {
+			const file = unitFile(mode, unit);
+			writeFileAtomic(join(paths.workDir, file), content);
+			ensureDir(dirname(join(paths.runDir, "drafts", file)));
+			writeFileAtomic(join(paths.runDir, "drafts", file), content);
+		}
 		state = prepared;
 		const docState = prepared;
 		docState.experiment = experiment;
@@ -1599,6 +1660,20 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 		const [tool, root] = key.split("\u0000") as [ChronoPlan["tool"], string];
 		ChronoStore.inspect(root, tool);
 	}
+	// Correction mode: the drafts store must be the mode's store, at the schema versions Mabillon reads.
+	const draftsSource = config.drafts !== undefined ? resolveDrafts(config.drafts, mode) : undefined;
+	// --force replaces the output store's units before the agent works; in place, those are the drafts.
+	if (
+		draftsSource &&
+		config.force &&
+		plans.some(
+			(plan) => canonicalPath(join(plan.root, DATABASE_NAMES[plan.tool])) === canonicalPath(draftsSource.database),
+		)
+	) {
+		throw new Error(
+			`--force would reset the drafts of ${draftsSource.database}, which is also the output store, before the agent corrects them; drop the documents with ${draftsSource.tool} drop to start over, or write the correction to a separate --out`,
+		);
+	}
 	const schema = resolveSchema(config.schema, mode, config.schemasDirs);
 	if (mode === "extract" && !envelopeInfo(schema.schema).entriesField) {
 		// Units are merged by concatenating their entries; without an entries array there is no defined merge.
@@ -1665,6 +1740,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 				notices,
 				plans[index],
 				registry,
+				draftsSource,
 			);
 			results[index] = result;
 			if (result.fatal) fatalError ??= result.error;

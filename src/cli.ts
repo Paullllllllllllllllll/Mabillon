@@ -78,6 +78,10 @@ Output and runs (ChronoTranscriber's outputs for transcribe, ChronoMiner's for e
   --formats <list>             transcribe: txt (default), md; extract: json (always), csv
   --force                      discard existing work for the documents and start over (their store units too)
   --redo-review                re-run units that were closed for review
+  --drafts <path>              correction mode: a chronotranscriber.sqlite (transcribe) or chronominer.sqlite
+                               (extract), or an output root with it; its units of the same input seed the unit
+                               files of a fresh run, and the agent corrects them
+  --drafts-document <name>     the store document to take the drafts from when several match the input
   --tools <list>               the agent's tools, comma-separated (default read,write,edit,view,verify,
                                add_entries,update_entry; also bash, python; tools that do not apply are left out)
   --bash                       add bash (a shell, not sandboxed) to the tools; --no-bash removes it
@@ -339,6 +343,7 @@ const PAGE_META_KEYS = new Set([
 	"hard_cap_closed",
 	"soft_cap_blocks",
 	"adopted_from",
+	"draft",
 ]);
 
 function readJsonFile(path: string): unknown {

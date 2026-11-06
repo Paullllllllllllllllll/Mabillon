@@ -23,7 +23,7 @@ export interface ChronoConfig {
 	out?: string;
 	/** Output layout below `out`: transcription hash (default) or mirror, extraction flat (default) or mirror. */
 	layout?: string;
-	/** Rendered formats: transcription txt and md (default both), extraction json (always) and csv. */
+	/** Rendered formats: transcription txt (default) and md, extraction json (always) and csv. */
 	formats?: string[];
 	/** Schema name (bundled or from schemasDirs) or path. */
 	schema?: string;
@@ -92,6 +92,13 @@ export interface ChronoConfig {
 	openrouterProviders?: string[];
 	/** OpenRouter: quantization levels the upstream providers may serve (e.g. ["fp8", "bf16"]). */
 	openrouterQuantizations?: string[];
+	/**
+	 * Correction mode: a chronotranscriber.sqlite (transcribe) or chronominer.sqlite (extract), or an output root
+	 * holding it, whose stored units seed the unit files of a fresh run; the agent corrects them.
+	 */
+	drafts?: string;
+	/** Correction mode: the store document to take the drafts from when several match the input. */
+	draftsDocument?: string;
 }
 
 export const DEFAULT_CONFIG: ChronoConfig = {
@@ -169,6 +176,8 @@ const KEY_ALIASES: Record<string, keyof ChronoConfig> = {
 	zdr: "zdr",
 	openrouterproviders: "openrouterProviders",
 	openrouterquantizations: "openrouterQuantizations",
+	drafts: "drafts",
+	draftsdocument: "draftsDocument",
 };
 
 const NUMBER_KEYS = new Set<keyof ChronoConfig>([
@@ -211,7 +220,7 @@ const BOOLEAN_KEYS = new Set<keyof ChronoConfig>([
 	"zdr",
 ]);
 const LIST_KEYS = new Set<keyof ChronoConfig>(["schemasDirs", "context", "contextImages"]);
-const PATH_KEYS = new Set<keyof ChronoConfig>(["out", "schemasDirs", "context", "contextImages"]);
+const PATH_KEYS = new Set<keyof ChronoConfig>(["out", "schemasDirs", "context", "contextImages", "drafts"]);
 
 /** Quantization levels OpenRouter can filter providers by. */
 export const OPENROUTER_QUANTIZATIONS = [

@@ -168,7 +168,14 @@ function transcriptionPrompt(options: PromptOptions): string {
 			return `${key}: |\n  <${key}>`;
 		})
 		.join("\n");
-	return `You are Mabillon, an expert transcriber of historical documents: manuscripts, early modern print, Fraktur and blackletter, tables and forms. You work through the pages of ${options.documentLabel} (${options.totalUnits} pages) one page at a time and produce a faithful transcription of each page as a file that is validated against a JSON schema.
+	const correcting = options.config.drafts !== undefined;
+	const task = correcting
+		? "correct an erroneous transcription of each page into a faithful transcription, in a file that is validated against a JSON schema"
+		: "produce a faithful transcription of each page as a file that is validated against a JSON schema";
+	const drafting = correcting
+		? `2. Unless the unit message says otherwise, the unit file already holds a transcription of this page that contains errors${options.tools.has("read") ? "; read it" : ""}.`
+		: "2. Transcribe the page in reading order into the unit file.";
+	return `You are Mabillon, an expert transcriber of historical documents: manuscripts, early modern print, Fraktur and blackletter, tables and forms. You work through the pages of ${options.documentLabel} (${options.totalUnits} pages) one page at a time and ${task}.
 
 ${workflowSection(options, "page")}
 
@@ -184,11 +191,11 @@ ${frontExample}
 <the transcription of the page>
 \`\`\`
 
-The front matter (YAML) holds every schema field except \`${bodyField}\`; the text below it is the \`${bodyField}\` field. Use \`key: |\` blocks for free text. For a page without text, set no_transcribable_text: true and leave the body empty. Set transcription_not_possible: true only when the page has text that cannot be transcribed at all (e.g. destroyed or completely illegible); the body must then be empty as well.
+The front matter (YAML) holds every schema field except \`${bodyField}\`; the text below it is the \`${bodyField}\` field. Use \`key: |\` blocks for free text. For a page without text, set no_transcribable_text: true and leave the body empty. Set transcription_not_possible: true only when the page has text that cannot be transcribed at all (e.g. destroyed or completely illegible); the body must then be empty as well.${correcting ? " A drafted page's transcription is already in this form; correct its text, and fill in or correct its front matter from the image." : ""}
 
 ## Method for each page
 1. Study the full page attached to the unit message: layout, columns, script, marginalia, page number, catchword, signature mark.
-2. Transcribe the page in reading order into the unit file.
+${drafting}
 3. Compare the draft line by line with the image.${
 		options.tools.has("python")
 			? " Do this with python: go through the whole page systematically, in overlapping bands or line strips (pagetools.bands, pagetools.line_strips; row_strips for tables) magnified until every character is unambiguous, and correct the draft band by band against these images. Zoom further into every passage you are still unsure about: small or faint type, abbreviations, numerals, names, marginalia, damage."
@@ -231,7 +238,11 @@ function extractionPrompt(options: PromptOptions): string {
 	const isImages = options.inputKind === "images";
 	const unitWord = isImages ? "page" : "chunk";
 	const example = isImages ? "p0007" : "c0007";
-	return `You are Mabillon, an expert in extracting structured data from historical documents. You work through ${options.documentLabel} (${options.totalUnits} ${unitWord}s) one ${unitWord} at a time and record every entry of the kind defined by the schema below, as JSON validated against that schema.
+	const correcting = options.config.drafts !== undefined;
+	const task = correcting
+		? `correct an erroneous extraction of each ${unitWord} so that it records every entry of the kind defined by the schema below, as JSON validated against that schema`
+		: "record every entry of the kind defined by the schema below, as JSON validated against that schema";
+	return `You are Mabillon, an expert in extracting structured data from historical documents. You work through ${options.documentLabel} (${options.totalUnits} ${unitWord}s) one ${unitWord} at a time and ${task}.
 
 ${workflowSection(options, unitWord)}
 
@@ -265,9 +276,11 @@ ${
 ## Method for each ${unitWord}
 1. ${isImages ? "Study the page attached to the unit message and locate" : "Read the chunk and locate"} every entry of the requested kind, top to bottom${isImages ? ", including margins" : ""}.
 2. ${
-		options.tools.has("add_entries")
-			? `Add all entries with add_entries, 1-3 per call in source order, following the field descriptions in the schema exactly${options.tools.has("write") ? " (write the whole file only if that is simpler, e.g. for an empty unit)" : ""}.`
-			: `${options.tools.has("write") ? "Write" : "Create (with bash)"} the unit file with all entries, following the field descriptions in the schema exactly.`
+		correcting
+			? `Unless the unit message says otherwise, the unit file already holds an extraction of this ${unitWord} that contains errors${options.tools.has("read") ? "; read it" : ""}.`
+			: options.tools.has("add_entries")
+				? `Add all entries with add_entries, 1-3 per call in source order, following the field descriptions in the schema exactly${options.tools.has("write") ? " (write the whole file only if that is simpler, e.g. for an empty unit)" : ""}.`
+				: `${options.tools.has("write") ? "Write" : "Create (with bash)"} the unit file with all entries, following the field descriptions in the schema exactly.`
 	}
 3. Check every field against the ${
 		isImages
