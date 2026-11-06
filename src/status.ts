@@ -82,9 +82,35 @@ function docState(docDir: string): DocState | undefined {
 	return existsSync(join(docDir, "run", "state.json")) ? loadState(join(docDir, "run")) : undefined;
 }
 
+const MAX_DEPTH = 8;
+
+/** The document working folders below `dir` (folders with run/state.json), in name order. */
+function workingFolders(dir: string, depth: number): string[] {
+	if (depth > MAX_DEPTH) return [];
+	const found: string[] = [];
+	let names: string[];
+	try {
+		names = readdirSync(dir).sort();
+	} catch {
+		return found;
+	}
+	for (const name of names) {
+		const child = join(dir, name);
+		try {
+			if (!statSync(child).isDirectory()) continue;
+		} catch {
+			continue;
+		}
+		if (existsSync(join(child, "run", "state.json"))) found.push(child);
+		else if (name !== "run" && name !== "work") found.push(...workingFolders(child, depth + 1));
+	}
+	return found;
+}
+
 /**
- * Read run state without a model: `path` may be a document output folder (contains run/), its run/ or work/
- * folder, or an output root such as mabillon_output/ with one folder per document.
+ * Read run state without a model: `path` may be a document's working folder (`.mabillon/<name>/`, which holds
+ * run/), its run/ or work/ folder, or an output root, whose `.mabillon/` folder holds one working folder per
+ * document.
  */
 export function collectStatus(path: string): DocumentStatus[] {
 	const root = resolve(path);
@@ -92,10 +118,9 @@ export function collectStatus(path: string): DocumentStatus[] {
 	const docDir = basename(root) === "run" || basename(root) === "work" ? dirname(root) : root;
 	const direct = docState(docDir);
 	if (direct) return [statusOf(docDir, direct)];
+	const base = existsSync(join(root, ".mabillon")) ? join(root, ".mabillon") : root;
 	const results: DocumentStatus[] = [];
-	for (const name of readdirSync(root).sort()) {
-		const dir = join(root, name);
-		if (!statSync(dir).isDirectory()) continue;
+	for (const dir of workingFolders(base, 0)) {
 		const state = docState(dir);
 		if (state) results.push(statusOf(dir, state));
 	}

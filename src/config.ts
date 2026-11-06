@@ -19,8 +19,12 @@ export interface ChronoConfig {
 	thinking?: ThinkingLevel;
 	/** OpenAI service tier sent with every request (OpenAI API key only; flex halves the price). */
 	serviceTier?: ServiceTier;
-	/** Output directory. Defaults to "<input folder>/mabillon_output". */
+	/** Output root (ChronoTranscriber's or ChronoMiner's --output). Without it the outputs go beside each input. */
 	out?: string;
+	/** Output layout below `out`: transcription hash (default) or mirror, extraction flat (default) or mirror. */
+	layout?: string;
+	/** Rendered formats: transcription txt and md (default both), extraction json (always) and csv. */
+	formats?: string[];
 	/** Schema name (bundled or from schemasDirs) or path. */
 	schema?: string;
 	/** Additional directories searched for schemas (wrapper format {name, strict, schema}). */
@@ -126,6 +130,8 @@ const KEY_ALIASES: Record<string, keyof ChronoConfig> = {
 	servicetier: "serviceTier",
 	out: "out",
 	output: "out",
+	layout: "layout",
+	formats: "formats",
 	schema: "schema",
 	schemasdirs: "schemasDirs",
 	schemadirs: "schemasDirs",
@@ -219,6 +225,36 @@ export const OPENROUTER_QUANTIZATIONS = [
 	"fp32",
 	"unknown",
 ] as const;
+
+/** Rendered formats: txt and md for transcription, json and csv for extraction. */
+const OUTPUT_FORMATS = ["txt", "md", "json", "csv"];
+/** Layouts: hash and mirror for transcription (ChronoTranscriber), flat and mirror for extraction (ChronoMiner). */
+const LAYOUTS = ["hash", "flat", "mirror"];
+
+/** The formats and layout of a mode, with its defaults; refuses those of the other mode. */
+export function outputSettings(
+	config: Pick<ChronoConfig, "formats" | "layout">,
+	mode: Mode,
+): { formats: string[]; layout: string } {
+	const own = mode === "transcribe" ? ["txt", "md"] : ["json", "csv"];
+	// ChronoTranscriber's and ChronoMiner's defaults: txt alone (a .md beside the .txt would give ChronoMiner two
+	// inputs of one name), json.
+	const formats = config.formats ?? (mode === "transcribe" ? ["txt"] : ["json"]);
+	const foreign = formats.filter((format) => !own.includes(format));
+	if (foreign.length > 0) {
+		throw new Error(
+			`--formats ${foreign.join(",")} does not apply to ${mode === "transcribe" ? "transcription (txt, md)" : "extraction (json, csv)"}`,
+		);
+	}
+	const layout = config.layout ?? (mode === "transcribe" ? "hash" : "flat");
+	const layouts = mode === "transcribe" ? ["hash", "mirror"] : ["flat", "mirror"];
+	if (!layouts.includes(layout)) {
+		throw new Error(
+			`--layout ${layout} does not apply to ${mode === "transcribe" ? "transcription" : "extraction"} (${layouts.join(" or ")})`,
+		);
+	}
+	return { formats, layout };
+}
 
 /** A comma-separated string or a YAML list of names (trimmed, empty entries dropped, duplicates removed). */
 function parseNameList(value: unknown): string[] {
@@ -341,6 +377,20 @@ export function coerceConfigValue(key: keyof ChronoConfig, value: unknown, baseD
 		throw new Error(`Config "${key}" must be true or false`);
 	}
 	if (key === "tools") return parseTools(value);
+	if (key === "formats") {
+		const formats = parseNameList(value).map((format) => format.toLowerCase());
+		const unknown = formats.filter((format) => !OUTPUT_FORMATS.includes(format));
+		if (unknown.length > 0 || formats.length === 0) {
+			throw new Error(`Config "formats": expected ${OUTPUT_FORMATS.join(", ")}, not "${value}"`);
+		}
+		return formats;
+	}
+	if (key === "layout") {
+		const layout = String(value).trim().toLowerCase();
+		if (!LAYOUTS.includes(layout))
+			throw new Error(`Config "layout" must be one of ${LAYOUTS.join(", ")}, not "${value}"`);
+		return layout;
+	}
 	if (key === "openrouterProviders") return parseNameList(value);
 	if (key === "openrouterQuantizations") {
 		const levels = parseNameList(value).map((level) => level.toLowerCase());

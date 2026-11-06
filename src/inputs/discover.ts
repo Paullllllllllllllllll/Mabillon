@@ -1,7 +1,11 @@
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import { listFolderImages } from "../chrono/paths.ts";
 import type { Mode } from "../config.ts";
 import { canonicalPath, naturalCompare, safeStem } from "../util.ts";
+
+/** Page images Mabillon decodes (sharp); a folder's other images (BMP, JPEG 2000, PNM) are left out of its pages. */
+export const READABLE_PAGE_IMAGES = new Set([".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp", ".gif"]);
 
 export type SourceKind = "pdf" | "images" | "text";
 
@@ -13,6 +17,10 @@ export interface SourceDocument {
 	path: string;
 	/** Page images in order (image documents only). */
 	images?: string[];
+	/** The input (command-line path) the document was found in; the hash and mirror layouts name outputs by it. */
+	inputRoot?: string;
+	/** Why the document cannot be processed (reported as its error before any work). */
+	refusal?: string;
 }
 
 const MAX_DEPTH = 8;
@@ -67,6 +75,17 @@ function isLineRangesFile(path: string): boolean {
 	return /_line_ranges\.txt$/i.test(basename(path));
 }
 
+/**
+ * Files Mabillon, ChronoTranscriber and ChronoMiner write or read beside an input: the stores and their journals,
+ * the ChronoMiner outputs, the Mabillon sidecars and the tools' context sidecars. They are never documents.
+ */
+export function isToolFile(path: string): boolean {
+	const name = basename(path).toLowerCase();
+	if (/^(chronotranscriber|chronominer)\.sqlite(-.*)?$/.test(name)) return true;
+	if (name.endsWith(".mabillon.json") || name.endsWith("_output.json") || name.endsWith("_output.csv")) return true;
+	return /_(extract|adjust|transcr)_context(_image)?\.[^.]+$/.test(name);
+}
+
 type EntryKind = "file" | "dir" | "broken";
 
 function entryKind(path: string): EntryKind {
@@ -83,10 +102,6 @@ function listDir(dir: string): string[] {
 		.filter((name) => !name.startsWith("."))
 		.sort(naturalCompare)
 		.map((name) => join(dir, name));
-}
-
-function imagesIn(dir: string): string[] {
-	return listDir(dir).filter((path) => entryKind(path) === "file" && isImageFile(path) && !isContextFile(path));
 }
 
 /**
@@ -147,22 +162,25 @@ export function discoverDocuments(inputs: string[], mode: Mode, exclude: string[
 	const skipped: Array<{ path: string; reason: string }> = [];
 	const seen = new Set<string>();
 
+	let inputRoot = "";
 	const add = (doc: SourceDocument) => {
 		// The same file reached through another spelling (case, drive letter case, symlink) is one document.
 		const key = canonicalPath(doc.path);
 		if (seen.has(key)) return;
 		seen.add(key);
-		documents.push(doc);
+		documents.push({ ...doc, inputRoot });
 	};
 
 	const addFile = (path: string, explicit: boolean) => {
-		if (isContextFile(path) || isLineRangesFile(path)) {
+		if (isContextFile(path) || isLineRangesFile(path) || isToolFile(path)) {
 			if (explicit) {
 				skipped.push({
 					path,
 					reason: isLineRangesFile(path)
 						? "ChronoMiner line-ranges files are read with their text document, not processed on their own"
-						: "named like a context file (context*, *.context*); rename it to process it as a document",
+						: isToolFile(path)
+							? "a store, output, sidecar or context file of Mabillon, ChronoTranscriber or ChronoMiner"
+							: "named like a context file (context*, *.context*); rename it to process it as a document",
 				});
 			}
 			return;
@@ -184,7 +202,14 @@ export function discoverDocuments(inputs: string[], mode: Mode, exclude: string[
 	};
 
 	const addImageFolder = (dir: string, images: string[]) => {
-		add({ stem: safeStem(basename(dir)), kind: "images", path: dir, images });
+		// The pages are ChronoTranscriber's page list of the folder (hidden and context-named images included); a page
+		// Mabillon cannot decode refuses the document rather than leaving the page out.
+		const unreadable = images.filter((image) => !READABLE_PAGE_IMAGES.has(extname(image).toLowerCase()));
+		const refusal =
+			unreadable.length > 0
+				? `${unreadable.map((image) => basename(image)).join(", ")} ${unreadable.length === 1 ? "is a page" : "are pages"} of the folder in ChronoTranscriber's page list that Mabillon cannot decode; convert ${unreadable.length === 1 ? "it" : "them"} to PNG or JPEG`
+				: undefined;
+		add({ stem: safeStem(basename(dir)), kind: "images", path: dir, images, ...(refusal ? { refusal } : {}) });
 	};
 
 	const visited = new Set<string>();
@@ -205,14 +230,18 @@ export function discoverDocuments(inputs: string[], mode: Mode, exclude: string[
 			skipped.push({ path: dir, reason: "folder cannot be read" });
 			return;
 		}
-		const directImages = imagesIn(dir);
+		// A folder is an image document when ChronoTranscriber's page list has an image that is not named as context
+		// (context.png beside a PDF stays context); all images of the list are then its pages.
+		const listed = listFolderImages(dir);
+		const directImages = listed.some((image) => !isContextFile(image)) ? listed : [];
 		if (directImages.length > 0) addImageFolder(dir, directImages);
+		const pages = new Set(directImages.map((image) => basename(image)));
 		for (const entry of entries) {
 			const entryType = entryKind(entry);
 			if (entryType === "broken") {
 				skipped.push({ path: entry, reason: "broken link or unreadable entry" });
 			} else if (entryType === "file") {
-				if (directImages.length > 0 && isImageFile(entry)) continue;
+				if (pages.has(basename(entry))) continue;
 				addFile(entry, false);
 			} else if (!isOutputFolder(entry)) {
 				if (depth >= MAX_DEPTH) skipped.push({ path: entry, reason: `deeper than ${MAX_DEPTH} folder levels` });
@@ -223,6 +252,7 @@ export function discoverDocuments(inputs: string[], mode: Mode, exclude: string[
 
 	for (const input of inputs) {
 		const path = resolve(input);
+		inputRoot = path;
 		const kind = entryKind(path);
 		if (kind === "broken") {
 			skipped.push({ path, reason: "does not exist or cannot be read" });

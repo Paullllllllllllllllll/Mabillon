@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	type AssistantMessage,
@@ -73,9 +73,13 @@ import {
 	makeImageFolder,
 	makePdf,
 	messageText,
+	outputFile,
 	RECIPES_SCHEMA,
+	readSidecar,
 	say,
+	sidecarFile,
 	tempDir,
+	workingDir,
 } from "./helpers.ts";
 
 const cleanups: Array<() => void> = [];
@@ -308,7 +312,7 @@ describe("helpers", () => {
 			updatedAt: "",
 		} as unknown as DocState;
 		const out = writeOutputs(paths, state, schema);
-		const provenance = JSON.parse(readFileSync(out.provenance as string, "utf8"));
+		const provenance = JSON.parse(readFileSync(out.sidecar, "utf8"));
 		expect(provenance.mabillon.varying_fields).toEqual(["active_city_or_town"]);
 		expect(provenance.entries[1].unit_fields.active_city_or_town).toBeNull();
 	});
@@ -501,7 +505,7 @@ describe("helpers", () => {
 			updatedAt: "",
 		} as unknown as DocState;
 		const out = writeOutputs(paths, state, schema);
-		const json = JSON.parse(readFileSync(out.json, "utf8"));
+		const json = JSON.parse(readFileSync(out.sidecar, "utf8"));
 		expect(json.pages[0].issues).toEqual([
 			{ severity: "warning", layer: "quality", location: "/transcription", message: "repeated line" },
 			{ severity: "warning", layer: "quality", message: "short page" },
@@ -511,7 +515,7 @@ describe("helpers", () => {
 		expect(json.pages[1].transcription).toBeUndefined();
 		expect(json.pages[2].integrity_error).toMatch(/missing/);
 		expect(json.mabillon.integrity_errors).toHaveLength(2);
-		expect(readFileSync(out.markdown as string, "utf8")).not.toContain("Changed afterwards");
+		expect(JSON.stringify(json)).not.toContain("Changed afterwards");
 	});
 });
 
@@ -549,7 +553,9 @@ describe("runs", () => {
 		expect(summary.documents[0].fatal).toBe(true);
 		// The document the fatal error kept from starting is reported, not dropped.
 		expect(summary.skipped).toEqual([{ path: second, reason: expect.stringMatching(/^not started: .*credentials/) }]);
-		const state = JSON.parse(readFileSync(join(root, "out", "first", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "first"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units[0].status).toBe("pending");
 	}, 60_000);
 
@@ -562,7 +568,8 @@ describe("runs", () => {
 		expect(firstRun.documents[0].error).toBeUndefined();
 		writeFileSync(text, "Ganz anderer Text.\n");
 		const secondRun = await h.run("extract", [text]);
-		expect(secondRun.documents[0].error).toMatch(/source differs/);
+		// The store's input identity is checked first, before anything local is changed.
+		expect(secondRun.documents[0].error).toMatch(/holds another input .*use --force/);
 	}, 60_000);
 
 	it("fails a corrupt PDF without stopping the batch", async () => {
@@ -606,11 +613,13 @@ describe("runs", () => {
 		const doc = summary.documents[0];
 		expect(doc.error).toBeUndefined();
 		expect(doc.needsReview).toBe(1);
-		const state = JSON.parse(readFileSync(join(root, "out", "pages", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "pages"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units[0].closedReason).toMatch(/tool budget/);
 		// The censored unit is identifiable in the state and the outputs.
 		expect(state.units[0].hardCapClosed).toBe(true);
-		const output = JSON.parse(readFileSync(join(root, "out", "pages", "pages.json"), "utf8"));
+		const output = readSidecar(join(root, "out"), "pages");
 		expect(output.mabillon.units_closed_by_hard_cap).toBe(1);
 		expect(output.pages[0].hard_cap_closed).toBe(true);
 	}, 60_000);
@@ -639,7 +648,7 @@ describe("runs", () => {
 		});
 		const summary = await h.run("extract", [text]);
 		expect(summary.documents[0].committed).toBe(1);
-		const provenance = JSON.parse(readFileSync(join(root, "out", "notes", "notes.provenance.json"), "utf8"));
+		const provenance = readSidecar(join(root, "out"), "notes");
 		expect(provenance.units[0].soft_cap_blocks).toBeGreaterThan(0);
 		expect(provenance.mabillon.units_with_soft_cap_blocks).toBe(1);
 		expect(provenance.units[0].session).toBe(1);
@@ -709,7 +718,7 @@ describe("experiment records", () => {
 		rmSync(join(root, "context.md"));
 		const resumed = await (await harness(emptyUnit, { out, schema })).run("extract", [text]);
 		expect(resumed.documents[0].error).toBeUndefined();
-		const provenance = JSON.parse(readFileSync(join(out, "notes", "notes.provenance.json"), "utf8"));
+		const provenance = readSidecar(out, "notes");
 		const meta = provenance.mabillon;
 		expect(meta.implementation.version).toMatch(/^\d+\.\d+\.\d+/);
 		expect(meta.experiment.tools).toEqual(["read", "write", "edit", "verify", "add_entries", "update_entry"]);
@@ -724,7 +733,7 @@ describe("experiment records", () => {
 		const root = tempDir();
 		const folder = await makeImageFolder(join(root, "pages"), 3);
 		await (await harness(diligent, { out: join(root, "out"), units: "1,3" })).run("transcribe", [folder]);
-		const output = JSON.parse(readFileSync(join(root, "out", "pages", "pages.json"), "utf8"));
+		const output = readSidecar(join(root, "out"), "pages");
 		expect(output.mabillon.selection).toMatchObject({ units: 2, unit_ids: ["p0001", "p0003"] });
 	}, 60_000);
 
@@ -750,7 +759,7 @@ describe("experiment records", () => {
 			await harness(emptyUnit, { out: join(root, "out2"), schema, allowPartialRanges: true })
 		).run("extract", [text]);
 		expect(allowed.documents[0].error).toBeUndefined();
-		const provenance = JSON.parse(readFileSync(join(root, "out2", "notes", "notes.provenance.json"), "utf8"));
+		const provenance = readSidecar(join(root, "out2"), "notes");
 		expect(provenance.mabillon.uncovered_lines).toEqual(["lines 2-2 are in no range"]);
 	}, 60_000);
 
@@ -758,9 +767,10 @@ describe("experiment records", () => {
 		const { root, text } = recipes();
 		const out = join(root, "out");
 		await (await harness(emptyUnit, { out, schema })).run("extract", [text]);
-		expect(collectStatus(join(out, "notes"))[0].complete).toBe(true);
-		rmSync(join(out, "notes", "notes.json"));
-		expect(collectStatus(join(out, "notes"))[0]).toMatchObject({
+		expect(collectStatus(out)[0].complete).toBe(true);
+		expect(collectStatus(workingDir(out, "notes"))[0].complete).toBe(true);
+		rmSync(join(out, "notes_output.json"));
+		expect(collectStatus(out)[0]).toMatchObject({
 			complete: false,
 			incompleteReason: "export missing or stale",
 		});
@@ -771,7 +781,11 @@ describe("experiment records", () => {
 		const folder = await makeImageFolder(join(root, "pages"), 2);
 		const out = join(root, "out");
 		await (await harness(() => say("Done."), { out, settleRetries: 0 })).run("transcribe", [folder]);
-		const files = ["run/state.json", "pages.json", "pages.md"].map((file) => join(out, "pages", file));
+		const files = [
+			join(workingDir(out, "pages"), "run", "state.json"),
+			sidecarFile(out, "pages"),
+			outputFile(out, "pages.txt"),
+		];
 		const before = files.map((file) => readFileSync(file));
 		const refused = await (await harness(diligent, { out, redoReview: true, settleRetries: 2 })).run("transcribe", [
 			folder,
@@ -813,7 +827,8 @@ describe("experiment records", () => {
 		const { root, text } = recipes();
 		const out = join(root, "out");
 		await (await harness(emptyUnit, { out, schema })).run("extract", [text]);
-		const statePath = join(out, "notes", "run", "state.json");
+		const docDir = workingDir(out, "notes");
+		const statePath = join(docDir, "run", "state.json");
 		const state = JSON.parse(readFileSync(statePath, "utf8")) as DocState;
 		const legacy = { ...state, experiment: undefined };
 		writeFileSync(statePath, JSON.stringify(legacy));
@@ -829,8 +844,8 @@ describe("experiment records", () => {
 		expect(draft.documents[0].error).toMatch(/predates experiment records/);
 		// Only a legacy run the agent never worked on (no sessions, drafts or notes) adopts the current experiment.
 		writeFileSync(statePath, JSON.stringify({ ...interrupted, sessions: [] }));
-		rmSync(join(out, "notes", "work", "units"), { recursive: true, force: true });
-		writeFileSync(join(out, "notes", "work", "notes.md"), "");
+		rmSync(join(docDir, "work", "units"), { recursive: true, force: true });
+		writeFileSync(join(docDir, "work", "notes.md"), "");
 		const adopted = await (await harness(emptyUnit, { out, schema })).run("extract", [text]);
 		expect(adopted.documents[0].error).toBeUndefined();
 		expect((JSON.parse(readFileSync(statePath, "utf8")) as DocState).experiment).toBeDefined();
@@ -863,7 +878,7 @@ describe("experiment records", () => {
 					if (last.role === "toolResult") replies.push(messageText(last));
 					if (last.role === "user" && currentUnit(context)) {
 						writeFileSync(
-							join(root, "out2", "notes", "work", "units", "c0001.json"),
+							join(workingDir(join(root, "out2"), "notes"), "work", "units", "c0001.json"),
 							Buffer.from('{"entries": [{"x": "Brühe"}]}', "latin1"),
 						);
 						return call("add_entries", { remove: [1] });
@@ -947,7 +962,7 @@ describe("run edge cases", () => {
 		const options = { out: join(root, "out"), schema: RECIPES_SCHEMA, chunkTokens: 60 };
 		// Unit 8 leaves c0007-c0010 in work/source; a later session on unit 1 must not read c0009.
 		await (await harness(diligent, { ...options, units: "8" })).run("extract", [text]);
-		const c0009 = readFileSync(join(root, "out", "notes", "work", "source", "c0009.txt"), "utf8");
+		const c0009 = readFileSync(join(workingDir(join(root, "out"), "notes"), "work", "source", "c0009.txt"), "utf8");
 		const attempts = ["Source/c0009.txt", "source./c0009.txt"];
 		const results: string[] = [];
 		const responder = (context: TranscriptContext) => {
@@ -973,7 +988,7 @@ describe("run edge cases", () => {
 		const text = join(root, "notes.txt");
 		writeFileSync(text, "Erstes Rezept. Take butter.\n");
 		// pi retries a missing path with curly apostrophes throughout, which here leads to another folder.
-		const decoy = join(root, "O’Brien", "notes", "work");
+		const decoy = join(root, "O’Brien", ".mabillon", "notes_output", "work");
 		mkdirSync(decoy, { recursive: true });
 		writeFileSync(join(decoy, "secret.txt"), "top secret");
 		const results: string[] = [];
@@ -999,7 +1014,7 @@ describe("run edge cases", () => {
 		const out = join(root, "out");
 		const first = await (await harness(diligent, { out })).run("transcribe", [folder]);
 		expect(first.documents[0].committed).toBe(3);
-		const committed = join(out, "pages", "run", "committed");
+		const committed = join(workingDir(out, "pages"), "run", "committed");
 		writeFileSync(join(committed, "p0002.md"), `${PAGE}Tampered text`);
 		rmSync(join(committed, "p0003.md"));
 		// Only unit 1 is selected: the reopened units stay pending and the export is not complete.
@@ -1007,14 +1022,16 @@ describe("run edge cases", () => {
 		const warnings = second.documents[0].warnings ?? [];
 		expect(warnings.some((warning) => /p0002: .*changed.*reopened/.test(warning))).toBe(true);
 		expect(warnings.some((warning) => /p0003: .*missing.*reopened/.test(warning))).toBe(true);
-		const output = JSON.parse(readFileSync(join(out, "pages", "pages.json"), "utf8"));
+		const output = readSidecar(out, "pages");
 		expect(output.mabillon).toMatchObject({ complete: false, units_pending: 2 });
 		expect(output.pages[1].status).toBe("pending");
 		expect(JSON.stringify(output)).not.toContain("Tampered text");
+		// The reopened units are pending in the store as well, so the text files leave them out.
+		expect(readFileSync(outputFile(out, "pages.txt"), "utf8")).not.toContain("Text of p0002");
 		// A full rerun redoes them.
 		const third = await (await harness(diligent, { out })).run("transcribe", [folder]);
 		expect(third.documents[0]).toMatchObject({ committed: 3, pending: 0 });
-		expect(readFileSync(join(out, "pages", "pages.md"), "utf8")).toContain("Text of p0002");
+		expect(readFileSync(outputFile(out, "pages.txt"), "utf8")).toContain("Text of p0002");
 	}, 60_000);
 
 	it("refuses to resume when the stored chunk text changed", async () => {
@@ -1024,7 +1041,7 @@ describe("run edge cases", () => {
 		const options = { out: join(root, "out"), schema: RECIPES_SCHEMA, chunkTokens: 60 };
 		const first = await (await harness(diligent, { ...options, units: "1" })).run("extract", [text]);
 		expect(first.documents[0].error).toBeUndefined();
-		const chunk = join(root, "out", "notes", "run", "text", "c0002.txt");
+		const chunk = join(workingDir(join(root, "out"), "notes"), "run", "text", "c0002.txt");
 		writeFileSync(chunk, readFileSync(chunk, "utf8").replace("butter", "lard"));
 		const second = await (await harness(diligent, options)).run("extract", [text]);
 		expect(second.documents[0].error).toMatch(/cannot be resumed: the stored text of c0002/);
@@ -1036,7 +1053,7 @@ describe("run edge cases", () => {
 		const out = join(root, "out");
 		await (await harness(diligent, { out, units: "1" })).run("transcribe", [folder]);
 		const schema = resolveSchema(undefined, "transcribe", []);
-		const statePath = join(out, "pages", "run", "state.json");
+		const statePath = join(workingDir(out, "pages"), "run", "state.json");
 		const state = JSON.parse(readFileSync(statePath, "utf8")) as DocState;
 		state.schema.sha256 = sha256Text(readFileSync(schema.path, "utf8"));
 		expect(state.schema.sha256).not.toBe(schema.sha256);
@@ -1053,8 +1070,9 @@ describe("run edge cases", () => {
 		writeFileSync(text, Array.from({ length: 20 }, (_, i) => `Recipe ${i + 1}. Take butter and flour.`).join("\n\n"));
 		const options = { out: join(root, "out"), schema: RECIPES_SCHEMA, chunkTokens: 60 };
 		await (await harness(diligent, { ...options, units: "1" })).run("extract", [text]);
-		const working = join(root, "out", "notes", "work", "source", "c0002.txt");
-		const canonical = readFileSync(join(root, "out", "notes", "run", "text", "c0002.txt"), "utf8");
+		const docDir = workingDir(join(root, "out"), "notes");
+		const working = join(docDir, "work", "source", "c0002.txt");
+		const canonical = readFileSync(join(docDir, "run", "text", "c0002.txt"), "utf8");
 		writeFileSync(working, "Recipe 99. Take nothing at all.");
 		const h = await harness(diligent, { ...options, units: "2" });
 		const summary = await h.run("extract", [text]);
@@ -1097,7 +1115,9 @@ describe("run edge cases", () => {
 		const summary = await h.run("extract", [text]);
 		expect(summary.documents[0].committed).toBe(1);
 		expect(replies[2]).toMatch(/NOT COMMITTED: .*earlier draft of c0001 in this session had 2/);
-		const state = JSON.parse(readFileSync(join(root, "out", "notes", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "notes"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units[0].issues?.some((issue) => /earlier draft in this session had 2/.test(issue.message))).toBe(
 			true,
 		);
@@ -1130,7 +1150,9 @@ describe("run edge cases", () => {
 		const summary = await h.run("extract", [text]);
 		expect(replies.slice(0, 2).every((reply) => /NOT COMMITTED: .*earlier draft/.test(reply))).toBe(true);
 		expect(summary.documents[0].committed).toBe(1);
-		const state = JSON.parse(readFileSync(join(root, "out", "notes", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "notes"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units[0].verifyRuns).toBe(3);
 	}, 60_000);
 
@@ -1138,7 +1160,7 @@ describe("run edge cases", () => {
 		const root = tempDir();
 		const text = join(root, "notes.txt");
 		writeFileSync(text, "Brühe mit Käse.\n");
-		const unitPath = join(root, "out", "notes", "work", "units", "c0001.json");
+		const unitPath = () => join(workingDir(join(root, "out"), "notes"), "work", "units", "c0001.json");
 		const replies: string[] = [];
 		const responder = (context: TranscriptContext) => {
 			const results = context.messages.filter((message) => message.role === "toolResult");
@@ -1146,12 +1168,12 @@ describe("run edge cases", () => {
 			if (last.role === "toolResult") replies.push(messageText(last));
 			if (results.length === 0) {
 				// A script on Windows writing cp1252 (as Python does without encoding="utf-8").
-				writeFileSync(unitPath, Buffer.from('{"note": "Brühe"}', "latin1"));
+				writeFileSync(unitPath(), Buffer.from('{"note": "Brühe"}', "latin1"));
 				return call("verify", { final: true });
 			}
 			if (results.length === 1) {
 				const json = JSON.stringify({ contains_no_content_of_requested_type: true, entries: [] });
-				writeFileSync(unitPath, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(json, "utf8")]));
+				writeFileSync(unitPath(), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(json, "utf8")]));
 				return call("verify", { final: true });
 			}
 			return say("done");
@@ -1161,7 +1183,10 @@ describe("run edge cases", () => {
 		expect(replies[0]).toMatch(/NOT COMMITTED/);
 		expect(replies[0]).toMatch(/units\/c0001\.json is not valid UTF-8 .*rewrite it with write/);
 		expect(summary.documents[0].committed).toBe(1);
-		const committed = readFileSync(join(root, "out", "notes", "run", "committed", "c0001.json"), "utf8");
+		const committed = readFileSync(
+			join(workingDir(join(root, "out"), "notes"), "run", "committed", "c0001.json"),
+			"utf8",
+		);
 		expect(committed.startsWith("{")).toBe(true);
 	}, 60_000);
 
@@ -1227,7 +1252,9 @@ describe("run edge cases", () => {
 		expect(replies[2]).toMatch(/^Not committed: entries' verbatim text covers only \d+% of the chunk/);
 		expect(replies[2]).toMatch(/keep the entries and call verify final=true again to confirm/);
 		expect(replies[2]).not.toContain("contains_no_content_of_requested_type");
-		const state = JSON.parse(readFileSync(join(root, "out", "cookbook", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "cookbook"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(
 			state.units[0].issues?.some((issue) => issue.message.startsWith("entries' verbatim text covers only")),
 		).toBe(true);
@@ -1244,7 +1271,7 @@ describe("run edge cases", () => {
 		renameSync(folder, moved);
 		const summary = await (await harness(diligent, { out })).run("transcribe", [moved]);
 		expect(summary.documents[0]).toMatchObject({ committed: 2, needsReview: 0 });
-		const state = JSON.parse(readFileSync(join(out, "pages", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(readFileSync(join(workingDir(out, "pages"), "run", "state.json"), "utf8")) as DocState;
 		expect(state.units.every((unit) => unit.image?.startsWith(moved))).toBe(true);
 	}, 60_000);
 
@@ -1270,12 +1297,12 @@ describe("run edge cases", () => {
 		expect(doc.needsReview).toBe(1);
 		expect(doc.finalValidation?.length).toBeGreaterThan(0);
 		expect(runExitCode([doc], false, false)).toBe(1);
-		const provenance = JSON.parse(readFileSync(join(root, "out", "notes", "notes.provenance.json"), "utf8"));
+		const provenance = readSidecar(join(root, "out"), "notes");
 		expect(provenance.mabillon.final_validation).toEqual(doc.finalValidation);
 		// Each unit record carries its remaining issues with severity, location and message.
 		expect(provenance.units[0].issues.some((issue: { severity: string }) => issue.severity === "error")).toBe(true);
 		// status reads the outcome of the export from the state.
-		const [status] = collectStatus(join(root, "out", "notes"));
+		const [status] = collectStatus(join(root, "out"));
 		expect(status.complete).toBe(false);
 		expect(status.finalValidation).toEqual(doc.finalValidation);
 	}, 60_000);
@@ -1305,7 +1332,9 @@ describe("run edge cases", () => {
 		const summary = await h.run("extract", [text]);
 		expect(replies[1]).toMatch(/NOT COMMITTED: units\/c0001\.json has no entries, but the chunk has content/);
 		expect(summary.documents[0].committed).toBe(1);
-		const state = JSON.parse(readFileSync(join(root, "out", "notes", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "notes"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(
 			state.units[0].issues?.some((issue) => /confirmed by the agent after a second look/.test(issue.message)),
 		).toBe(true);
@@ -1318,7 +1347,9 @@ describe("run edge cases", () => {
 		const h = await harness(diligent, { out: join(root, "out") });
 		const summary = await h.run("transcribe", [folder]);
 		expect(summary.documents[0].error).toMatch(/3 consecutive units were closed for review/);
-		const state = JSON.parse(readFileSync(join(root, "out", "pages", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "pages"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units.map((unit) => unit.status)).toEqual([
 			"needs_review",
 			"needs_review",
@@ -1530,7 +1561,9 @@ describe("run edge cases", () => {
 		// Result counts are relative to the selection; the unit outside it keeps its review status and draft.
 		expect(second.documents[0].committed).toBe(1);
 		expect(second.documents[0].needsReview).toBe(0);
-		const state = JSON.parse(readFileSync(join(root, "out", "pages", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "pages"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units.map((unit) => unit.status)).toEqual(["committed", "needs_review"]);
 	}, 60_000);
 
@@ -1629,7 +1662,7 @@ describe("add_entries", () => {
 			...overrides,
 		});
 		const summary = await h.run("extract", [text]);
-		const docDir = join(root, "out", "kochbuch");
+		const docDir = workingDir(join(root, "out"), "kochbuch");
 		return { summary, docDir, h };
 	}
 	const entry = (i: number) => ({ title_original: null, text_original: UMLAUT_RECIPES[i] });
@@ -1845,7 +1878,7 @@ describe("add_entries", () => {
 		});
 		const expected = ["read", "write", "edit", "verify", "add_entries", "update_entry"];
 		expect(summary.documents[0].tools).toEqual(expected);
-		const provenance = JSON.parse(readFileSync(join(docDir, "kochbuch.provenance.json"), "utf8"));
+		const provenance = readSidecar(dirname(dirname(docDir)), "kochbuch");
 		expect(provenance.mabillon.tools).toEqual(expected);
 		const request = JSON.stringify(h.faux.requests[0]);
 		expect(request).toContain("## Tools");
@@ -1978,7 +2011,9 @@ describe("add_entries", () => {
 		const summary = await h.run("extract", [text]);
 		expect(replies[0]).toMatch(/now has 3 entries \(added 3\)/);
 		expect(summary.documents[0].committed + summary.documents[0].needsReview).toBe(1);
-		const data = JSON.parse(readFileSync(join(root, "out", "kochbuch", "work", "units", "c0001.json"), "utf8"));
+		const data = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "kochbuch"), "work", "units", "c0001.json"), "utf8"),
+		);
 		expect(data.title).toBe("Suppen");
 	}, 60_000);
 
@@ -2184,7 +2219,7 @@ describe("add_entries", () => {
 		const summary = await h.run("transcribe", [folder]);
 		expect(summary.documents[0].committed).toBe(1);
 		expect(replies[0]).toMatch(/not found|unknown|not available/i);
-		expect(existsSync(join(root, "out", "pages", "work", "units", "p0001.json"))).toBe(false);
+		expect(existsSync(join(workingDir(join(root, "out"), "pages"), "work", "units", "p0001.json"))).toBe(false);
 	}, 60_000);
 });
 

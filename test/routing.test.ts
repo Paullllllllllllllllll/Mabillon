@@ -302,7 +302,9 @@ describe("OpenRouter routing", () => {
 				(modelRuntime.getModel("my-router", "qwen3.8-27b")?.compat as { openRouterRouting?: unknown })
 					.openRouterRouting,
 			).toEqual({ quantizations: ["int4"], zdr: true });
-			const state = JSON.parse(readFileSync(join(root, "out", "book", "run", "state.json"), "utf8")) as DocState;
+			const state = JSON.parse(
+				readFileSync(join(summary.documents[0].workingDir as string, "run", "state.json"), "utf8"),
+			) as DocState;
 			expect(state.sessions[0].routing).toEqual(sent);
 		} finally {
 			faux.unregister();

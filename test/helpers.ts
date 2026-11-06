@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	type AssistantMessage,
@@ -62,6 +62,56 @@ export function tempDir(prefix = "mabillon-test-"): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function folders(dir: string, depth = 0): string[] {
+	if (depth > 8 || !existsSync(dir)) return [];
+	return readdirSync(dir, { withFileTypes: true })
+		.filter((entry) => entry.isDirectory())
+		.flatMap((entry) => [join(dir, entry.name), ...folders(join(dir, entry.name), depth + 1)]);
+}
+
+/** The working folder `<root>/.mabillon/<document name>/` of the document whose name ends in `stem`. */
+/** The names a document's working folder and sidecar take: `<stem>` (transcription), else `<stem>_output` (extraction). */
+function namesOf(stem: string): string[] {
+	return [stem, `${stem}_output`];
+}
+
+export function workingDir(root: string, stem: string): string {
+	for (const name of namesOf(stem)) {
+		const found = folders(join(root, ".mabillon")).filter(
+			(dir) => basename(dir) === name && existsSync(join(dir, "run", "state.json")),
+		);
+		if (found.length > 1)
+			throw new Error(`expected one working folder for ${name} below ${root}, found ${found.length}`);
+		if (found.length === 1) return found[0];
+	}
+	throw new Error(`expected one working folder for ${stem} below ${root}, found 0`);
+}
+
+/** The sidecar `<stem>.mabillon.json` (or `<stem>_output.mabillon.json`) below an output root (outside `.mabillon/`). */
+export function sidecarFile(root: string, stem: string): string {
+	for (const name of namesOf(stem)) {
+		const candidates = [root, ...folders(root).filter((dir) => !dir.split(/[\\/]/).includes(".mabillon"))]
+			.map((dir) => join(dir, `${name}.mabillon.json`))
+			.filter((path) => existsSync(path));
+		if (candidates.length > 1) throw new Error(`expected one sidecar ${name}.mabillon.json below ${root}`);
+		if (candidates.length === 1) return candidates[0];
+	}
+	throw new Error(`expected one sidecar ${stem}.mabillon.json below ${root}`);
+}
+
+export function readSidecar(root: string, stem: string): any {
+	return JSON.parse(readFileSync(sidecarFile(root, stem), "utf8"));
+}
+
+/** A rendered file of a document below an output root (outside `.mabillon/`), e.g. `book.txt` or `notes_output.json`. */
+export function outputFile(root: string, name: string): string {
+	const candidates = [root, ...folders(root).filter((dir) => !dir.split(/[\\/]/).includes(".mabillon"))]
+		.map((dir) => join(dir, name))
+		.filter((path) => existsSync(path));
+	if (candidates.length !== 1) throw new Error(`expected one ${name} below ${root}, found ${candidates.length}`);
+	return candidates[0];
 }
 
 export function messageText(message: Message | undefined): string {

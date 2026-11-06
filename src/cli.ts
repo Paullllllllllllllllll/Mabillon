@@ -11,8 +11,7 @@ import {
 	mergeConfig,
 	normalizeKey,
 } from "./config.ts";
-import { type DocumentResult, run } from "./driver.ts";
-import { OUTPUT_DIR_NAME } from "./inputs/discover.ts";
+import { type DocumentResult, documentStatus, run, runExitCode } from "./driver.ts";
 import { loadTextDocument } from "./inputs/text.ts";
 import {
 	DEFAULT_TRANSCRIPTION_SCHEMA,
@@ -26,6 +25,8 @@ import { collectStatus } from "./status.ts";
 import { errorMessage, readPackageVersion, readUtf8File } from "./util.ts";
 import { formatIssues, type Issue } from "./verify/issues.ts";
 import { verifyTranscriptionPage, verifyUnitContent } from "./verify/verify.ts";
+
+export { type DocumentStatusLabel, runExitCode } from "./driver.ts";
 
 const HELP = `Mabillon ${readPackageVersion()}: agentic transcription and schema-validated extraction
 
@@ -71,9 +72,11 @@ OpenRouter (models named openrouter/<vendor>/<model>):
   --openrouter-quantizations <list>
                                precisions the providers may serve (e.g. fp8,bf16)
 
-Output and runs:
-  --out <dir>                  output directory (default: mabillon_output next to each input)
-  --force                      discard existing work for the documents and start over
+Output and runs (ChronoTranscriber's outputs for transcribe, ChronoMiner's for extract):
+  --out <dir>                  output root with the store (default: beside each input)
+  --layout <layout>            below --out: transcribe hash (default) or mirror; extract flat (default) or mirror
+  --formats <list>             transcribe: txt (default), md; extract: json (always), csv
+  --force                      discard existing work for the documents and start over (their store units too)
   --redo-review                re-run units that were closed for review
   --tools <list>               the agent's tools, comma-separated (default read,write,edit,view,verify,
                                add_entries,update_entry; also bash, python; tools that do not apply are left out)
@@ -241,22 +244,13 @@ function fail(parsed: ParsedArgs, message: string, code = 2): number {
 	return code;
 }
 
-export type DocumentStatusLabel = "complete" | "needs_review" | "incomplete" | "failed";
-
-function documentStatus(doc: DocumentResult): DocumentStatusLabel {
-	if (doc.error) return "failed";
-	if (doc.pending > 0) return "incomplete";
-	// The merged output does not validate against the schema.
-	if (doc.finalValidation?.length) return "failed";
-	return doc.needsReview > 0 ? "needs_review" : "complete";
-}
-
 function documentJson(doc: DocumentResult) {
 	return {
 		stem: doc.stem,
 		source: doc.source,
 		status: documentStatus(doc),
 		output_dir: doc.outputDir,
+		...(doc.workingDir ? { working_dir: doc.workingDir } : {}),
 		outputs: doc.outputs ?? {},
 		units_total: doc.units,
 		units_selected: doc.selected,
@@ -269,16 +263,6 @@ function documentJson(doc: DocumentResult) {
 		...(doc.finalValidation?.length ? { final_validation: doc.finalValidation } : {}),
 		...(doc.error ? { error: doc.error } : {}),
 	};
-}
-
-/** Exit code of a run: interrupted, credentials, failures/incomplete, review, success (in that precedence). */
-export function runExitCode(documents: DocumentResult[], interrupted: boolean, fatal: boolean): number {
-	if (interrupted) return 130;
-	if (fatal) return 2;
-	const statuses = documents.map(documentStatus);
-	if (statuses.some((status) => status === "failed" || status === "incomplete")) return 1;
-	if (statuses.includes("needs_review")) return 3;
-	return 0;
 }
 
 async function runCommand(mode: Mode, parsed: ParsedArgs): Promise<number> {
@@ -354,6 +338,7 @@ const PAGE_META_KEYS = new Set([
 	"session",
 	"hard_cap_closed",
 	"soft_cap_blocks",
+	"adopted_from",
 ]);
 
 function readJsonFile(path: string): unknown {
@@ -364,7 +349,7 @@ function readJsonFile(path: string): unknown {
 	}
 }
 
-/** Schema recorded by Mabillon for an output file (in the file itself or its .provenance.json). */
+/** Schema recorded by Mabillon for an output file: in the file itself, its .mabillon.json sidecar, or (runs before 0.10.0) its .provenance.json. */
 interface RecordedSchema {
 	name: string;
 	path?: string;
@@ -385,8 +370,12 @@ function recordedSchema(path: string, data: unknown): RecordedSchema | undefined
 	};
 	const own = fromMetadata(data);
 	if (own) return own;
+	// The sidecar of `<stem>.txt` is `<stem>.mabillon.json`, that of `<stem>_output.json` `<stem>_output.mabillon.json`.
 	const stem = basename(path, extname(path));
-	for (const candidate of [join(dirname(path), `${stem}.provenance.json`), join(dirname(path), `${stem}.json`)]) {
+	const candidates = [`${stem}.mabillon.json`, `${stem}.provenance.json`, `${stem}.json`].map((file) =>
+		join(dirname(path), file),
+	);
+	for (const candidate of candidates) {
 		if (candidate === path || !existsSync(candidate)) continue;
 		const found = fromMetadata(readJsonFile(candidate));
 		if (found) return found;
@@ -437,6 +426,11 @@ async function verifyCommand(parsed: ParsedArgs): Promise<number> {
 		}
 		const transcriptionOutput =
 			!!data && typeof data === "object" && Array.isArray((data as Record<string, unknown>).pages);
+		// An extraction sidecar (<stem>.mabillon.json): its merged object is checked.
+		const sidecar = data as { mabillon?: unknown; merged?: unknown } | undefined;
+		if (!transcriptionOutput && sidecar && typeof sidecar === "object" && sidecar.mabillon && "merged" in sidecar) {
+			content = JSON.stringify(sidecar.merged, null, 2);
+		}
 		// A merged transcript (<stem>.md without front matter) is checked as one body.
 		const mergedTranscript = isMarkdown && !/^﻿?---[ \t]*\r?\n/.test(content);
 		if (mergedTranscript) content = `---\n---\n${content}`;
@@ -538,8 +532,8 @@ function schemasCommand(parsed: ParsedArgs): number {
 
 function statusCommand(parsed: ParsedArgs): number {
 	try {
-		// Without a path, the output folder of mabillon.yaml (out:) or --out, as for runs.
-		const path = parsed.positionals[0] ?? loadConfig(parsed).out ?? OUTPUT_DIR_NAME;
+		// Without a path, the output folder of mabillon.yaml (out:) or --out, as for runs, else the current folder.
+		const path = parsed.positionals[0] ?? loadConfig(parsed).out ?? ".";
 		const documents = collectStatus(path);
 		if (documents.length === 0) return fail(parsed, `No Mabillon runs found under ${resolve(path)}.`, 1);
 		if (parsed.json) {

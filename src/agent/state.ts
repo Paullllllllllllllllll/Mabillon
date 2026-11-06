@@ -33,6 +33,17 @@ export interface UnitRecord {
 	/** sha256 of the committed unit file. */
 	contentHash?: string;
 	/**
+	 * A unit another tool finished in the shared ChronoTranscriber or ChronoMiner store: its stored content is the
+	 * committed copy, the agent does not work it, and its store row stays as that tool wrote it.
+	 */
+	adopted?: { tool: string; runId: string; model?: string; outcome?: string };
+	/**
+	 * The unit's store row as Mabillon last saw it (at the start of a run, before any agent work) or wrote it (at the
+	 * export). A row with another run_id, status or stale flag was reset or replaced since (ChronoTranscriber and
+	 * ChronoMiner keep the tool column when they do), and a finished unit is then worked again.
+	 */
+	storeRow?: { status: string; stale: number; runId: string };
+	/**
 	 * Extraction: entries add_entries rejected that no later call resolved (kept across sessions until the unit is
 	 * committed or reset), and the number of the next rejection ID.
 	 */
@@ -126,16 +137,23 @@ export interface DocState {
 	uncoveredLines?: string[];
 	/**
 	 * Outcome of the last export (read by `status`): schema errors of the merged output, or why it failed, the unit
-	 * state it was made from (`unitsDigest`) and the files written.
+	 * state it was made from (`unitsDigest`), the files written (relative to the document's working folder) and, for a
+	 * transcription without a store row, the hashes of its text files (the overwrite guard's record).
 	 */
-	export?: { at: string; finalValidation?: string[]; error?: string; unitsDigest?: string; files?: string[] };
+	export?: {
+		at: string;
+		finalValidation?: string[];
+		error?: string;
+		unitsDigest?: string;
+		files?: string[];
+		hashes?: Record<string, string>;
+	};
 	createdAt: string;
 	updatedAt: string;
 }
 
 /**
- * Output layout of one document:
- *   <docDir>/<stem>.json, .md, .provenance.json   final outputs
+ * Working folder of one document, `<output root>/.mabillon/<document name>/` (the outputs sit in the output root):
  *   <docDir>/work/                               the agent's working directory (units/, notes.md, scratch/, source/)
  *   <docDir>/run/                                internal: state.json, lock, text/, committed/, sessions/
  */

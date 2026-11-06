@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import type { DocState } from "../src/agent/state.ts";
@@ -12,8 +12,11 @@ import {
 	makeImageFolder,
 	makePdf,
 	messageText,
+	outputFile,
+	readSidecar,
 	say,
 	tempDir,
+	workingDir,
 } from "./helpers.ts";
 
 const cleanups: Array<() => void> = [];
@@ -69,7 +72,8 @@ describe("transcription", () => {
 	it("works through an image folder unit by unit, with sessions, handoff, gate and compaction", async () => {
 		const root = tempDir();
 		const folder = await makeImageFolder(join(root, "book"), 5);
-		writeFileSync(join(folder, "context.md"), "Seventeenth-century English cookery book, roman type.");
+		// Context sits beside the folder (images inside it are its pages).
+		writeFileSync(join(root, "context.md"), "Seventeenth-century English cookery book, roman type.");
 		const blocked: string[] = [];
 		let triedForeignWrite = false;
 		const responder = (context: TranscriptContext) => {
@@ -110,7 +114,8 @@ describe("transcription", () => {
 		expect(doc.needsReview).toBe(0);
 		expect(blocked[0]).toMatch(/You can only write units\/p0001\.md/);
 
-		const state = JSON.parse(readFileSync(join(root, "out", "book", "run", "state.json"), "utf8")) as DocState;
+		const out = join(root, "out");
+		const state = JSON.parse(readFileSync(join(workingDir(out, "book"), "run", "state.json"), "utf8")) as DocState;
 		expect(state.sessions).toHaveLength(3);
 		expect(state.units.every((unit) => unit.status === "committed")).toBe(true);
 		expect(state.sessions.reduce((sum, session) => sum + (session.compactions ?? 0), 0)).toBeGreaterThan(0);
@@ -132,12 +137,18 @@ describe("transcription", () => {
 			.join("\n");
 		expect(systemText).toContain("Seventeenth-century English cookery book");
 
-		const output = JSON.parse(readFileSync(join(root, "out", "book", "book.json"), "utf8"));
+		const output = readSidecar(out, "book");
 		expect(output.pages).toHaveLength(5);
 		expect(output.pages[0].transcription).toContain("ſpinage");
 		expect(output.mabillon.complete).toBe(true);
-		const markdown = readFileSync(join(root, "out", "book", "book.md"), "utf8");
-		expect(markdown).toContain("<!-- page 3 (p0003) -->");
+		// ChronoTranscriber's file: the hash layout below --out, pages joined by a newline; txt alone by default.
+		const txt = outputFile(out, "book.txt");
+		expect(txt).toMatch(/[\\/]book-[0-9a-f]{8}[\\/]book\.txt$/);
+		const page = (n: number) =>
+			`<page_number>${n}</page_number>\nTo make a Tart of Hearbs.\nTake ſpinage and <unclear>parſley</unclear>, and boyle them.`;
+		expect(readFileSync(txt, "utf8")).toBe(`${[1, 2, 3, 4, 5].map(page).join("\n")}\n`);
+		expect(existsSync(join(dirname(txt), "book.md"))).toBe(false);
+		expect(output.mabillon.store.documents).toEqual([basename(dirname(txt)).concat("/book")]);
 	}, 120_000);
 
 	it("closes a unit for review when the tool budget is exhausted", async () => {
@@ -149,7 +160,9 @@ describe("transcription", () => {
 		const doc = summary.documents[0];
 		expect(doc.error).toBeUndefined();
 		expect(doc.needsReview).toBe(2);
-		const state = JSON.parse(readFileSync(join(root, "out", "scans", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "scans"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.units[0].closedReason).toMatch(/tool budget/);
 		expect(state.units[0].toolCalls).toBe(4);
 	}, 120_000);
@@ -168,7 +181,9 @@ describe("transcription", () => {
 		);
 		// Each unit gets a second session before it is closed; every session nudges settleRetries times.
 		expect(nudges).toHaveLength(4);
-		const state = JSON.parse(readFileSync(join(root, "out", "lazy", "run", "state.json"), "utf8")) as DocState;
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "lazy"), "run", "state.json"), "utf8"),
+		) as DocState;
 		expect(state.sessions).toHaveLength(4);
 		expect(state.units[0].closedReason).toBe("the agent stopped twice without committing");
 	}, 120_000);
@@ -188,7 +203,7 @@ describe("transcription", () => {
 		const summary = await harness.run("transcribe", [pdf]);
 		expect(summary.documents[0].committed).toBe(2);
 		// Pages are rendered in memory and never written as lossy files.
-		expect(existsSync(join(root, "out", "receipts", "work", "source"))).toBe(false);
+		expect(existsSync(join(workingDir(join(root, "out"), "receipts"), "work", "source"))).toBe(false);
 		const firstRequest = harness.faux.requests[0];
 		const firstUser = firstRequest.messages.find((message) => message.role === "user");
 		expect(messageText(firstUser)).toMatch(/Page p0001: full page; source 1275x1650 px/);
@@ -278,20 +293,31 @@ describe("extraction from text", () => {
 		const doc = summary.documents[0];
 		expect(doc.error).toBeUndefined();
 		expect(doc.committed).toBeGreaterThan(1);
-		const state = JSON.parse(readFileSync(join(root, "out", "cookbook", "run", "state.json"), "utf8")) as DocState;
+		const out = join(root, "out");
+		const docDir = workingDir(out, "cookbook");
+		const state = JSON.parse(readFileSync(join(docDir, "run", "state.json"), "utf8")) as DocState;
 		expect(state.units[0].issues?.some((issue) => issue.layer === "grounding")).toBe(true);
 		expect(state.units[0].carryOver).toBe("nothing carried; test note");
-		const output = JSON.parse(readFileSync(join(root, "out", "cookbook", "cookbook.json"), "utf8"));
+		const provenance = readSidecar(out, "cookbook");
+		const output = provenance.merged;
 		expect(output.contains_no_content_of_requested_type).toBe(false);
 		expect(output.entries).toHaveLength(6);
-		const provenance = JSON.parse(readFileSync(join(root, "out", "cookbook", "cookbook.provenance.json"), "utf8"));
 		expect(provenance.entries).toHaveLength(6);
 		expect(provenance.entries[0].lines[0]).toBe(1);
 		expect(provenance.mabillon.final_validation).toBeUndefined();
+		// ChronoMiner's file: one record per chunk, the unit's JSON object as the answer text.
+		const records = JSON.parse(readFileSync(join(out, "cookbook_output.json"), "utf8"));
+		expect(records._chronominer_metadata).toMatchObject({
+			schema_name: "MiniRecipes",
+			total_chunks: state.units.length,
+		});
+		expect(records.records).toHaveLength(state.units.length);
+		expect(records.records[0]).toMatchObject({ custom_id: "cookbook-chunk-1", chunk_index: 1 });
+		expect(JSON.parse(records.records[0].response.output_text).entries.length).toBeGreaterThan(0);
 		// Chunks start at recipe titles, and each unit shows the start of the next chunk as context.
 		expect(
 			state.units.every((unit) =>
-				readFileSync(join(root, "out", "cookbook", "run", "text", `${unit.id}.txt`), "utf8").startsWith("To make"),
+				readFileSync(join(docDir, "run", "text", `${unit.id}.txt`), "utf8").startsWith("To make"),
 			),
 		).toBe(true);
 		const first = messageText(harness.faux.requests[0].messages[harness.faux.requests[0].messages.length - 1]);

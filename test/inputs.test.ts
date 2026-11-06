@@ -242,9 +242,9 @@ describe("outputs", () => {
 			createdAt: "",
 			updatedAt: "",
 		} as unknown as DocState;
+		// The draft of a page closed for review stays in the sidecar (the store and the text files mark it failed).
 		const out = writeOutputs(paths, state, schema);
-		expect(readFileSync(out.markdown as string, "utf8")).toContain("Just the text, no front matter.");
-		const json = JSON.parse(readFileSync(out.json, "utf8"));
+		const json = JSON.parse(readFileSync(out.sidecar, "utf8"));
 		expect(json.pages[0].transcription).toBe("Just the text, no front matter.");
 		expect(json.pages[0].parse_error).toBeDefined();
 	});
@@ -277,7 +277,7 @@ describe("outputs", () => {
 			updatedAt: "",
 		} as unknown as DocState;
 		const out = writeOutputs(paths, state, schema);
-		const provenance = JSON.parse(readFileSync(out.provenance as string, "utf8"));
+		const provenance = JSON.parse(readFileSync(out.sidecar, "utf8"));
 		expect(provenance.mabillon.varying_fields).toEqual(["active_city_or_town"]);
 		expect(
 			provenance.entries.map(

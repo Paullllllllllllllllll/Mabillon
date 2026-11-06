@@ -1,8 +1,9 @@
-import { join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { readCommitted } from "./agent/runtime.ts";
 import { type DocPaths, type DocState, isDone, type UnitRecord } from "./agent/state.ts";
+import { PyNumberLexeme, pyJsonParse } from "./chrono/py.ts";
 import { envelopeInfo, type LoadedSchema } from "./schemas/registry.ts";
-import { implementationFingerprint, readPackageVersion, writeFileAtomic, writeJson } from "./util.ts";
+import { implementationFingerprint, readPackageVersion, writeJson } from "./util.ts";
 import { formatIssue } from "./verify/issues.ts";
 import { parseTranscriptionUnit } from "./verify/rules.ts";
 import { verifyObject } from "./verify/verify.ts";
@@ -64,6 +65,15 @@ export interface RunMetadata {
 	created_at: string;
 	updated_at: string;
 	final_validation?: string[];
+	/** The ChronoTranscriber or ChronoMiner store and the documents of it that hold this document's units. */
+	store?: StoreRecord;
+	/** Units another tool had finished in the store; they were adopted without agent work. */
+	units_adopted?: number;
+}
+
+export interface StoreRecord {
+	database: string;
+	documents: string[];
 }
 
 function buildMetadata(state: DocState, schema: LoadedSchema, selected: (index: number) => boolean): RunMetadata {
@@ -123,6 +133,8 @@ function buildMetadata(state: DocState, schema: LoadedSchema, selected: (index: 
 		created_at: state.createdAt,
 		updated_at: new Date().toISOString(),
 	};
+	const adopted = state.units.filter((unit) => unit.adopted).length;
+	if (adopted > 0) metadata.units_adopted = adopted;
 	if (inSelection.length < state.units.length) {
 		metadata.selection = {
 			units: inSelection.length,
@@ -186,13 +198,20 @@ function runInfo(unit: UnitRecord): Record<string, unknown> {
 		...(unit.session !== undefined ? { session: unit.session } : {}),
 		...(unit.hardCapClosed ? { hard_cap_closed: true } : {}),
 		...(unit.softCapBlocks ? { soft_cap_blocks: unit.softCapBlocks } : {}),
+		...(unit.adopted ? { adopted_from: { tool: unit.adopted.tool, run_id: unit.adopted.runId } } : {}),
 	};
 }
 
 export interface OutputPaths {
-	json: string;
-	markdown?: string;
-	provenance?: string;
+	/** `<stem>.mabillon.json`: Mabillon's run metadata with the pages (transcription) or the merged object and provenance. */
+	sidecar: string;
+	/** Rendered files: `txt`, `md` (transcription) or `json`, `csv` (extraction). */
+	txt?: string;
+	md?: string;
+	json?: string;
+	csv?: string;
+	/** The ChronoTranscriber or ChronoMiner store the units were written to. */
+	store?: string;
 }
 
 function writeTranscription(
@@ -200,10 +219,11 @@ function writeTranscription(
 	state: DocState,
 	schema: LoadedSchema,
 	selected: (index: number) => boolean,
+	sidecar: string,
+	store: StoreRecord | undefined,
 ): OutputPaths {
 	const bodyField = schema.rules.bodyField ?? "transcription";
 	const pages: Array<Record<string, unknown>> = [];
-	const markdown: string[] = [];
 	for (const unit of state.units) {
 		const page: Record<string, unknown> = {
 			unit: unit.id,
@@ -224,32 +244,12 @@ function writeTranscription(
 			page.parse_error = parsed.issues.map(formatIssue).join("; ");
 		}
 		pages.push(page);
-		if (!isDone(unit)) continue;
-		markdown.push(`<!-- page ${unit.index} (${unit.id})${unit.status === "needs_review" ? " needs review" : ""} -->`);
-		const data = parsed?.data;
-		if (data?.no_transcribable_text === true) {
-			markdown.push("[No transcribable text]");
-		} else if (data?.transcription_not_possible === true) {
-			markdown.push("[Transcription not possible]");
-		} else if (data && typeof data[bodyField] === "string") {
-			markdown.push(data[bodyField] as string);
-		} else if (parsed?.body) {
-			markdown.push(parsed.body);
-		} else if (page.integrity_error) {
-			markdown.push(`[Transcription not exported: ${page.integrity_error}]`);
-		} else {
-			markdown.push("[Transcription missing]");
-		}
 	}
-	const out: OutputPaths = {
-		json: join(paths.docDir, `${state.stem}.json`),
-		markdown: join(paths.docDir, `${state.stem}.md`),
-	};
 	const metadata = buildMetadata(state, schema, selected);
+	if (store) metadata.store = store;
 	recordIntegrity(metadata, pages);
-	writeJson(out.json, { mabillon: metadata, pages });
-	writeFileAtomic(out.markdown as string, markdown.length > 0 ? `${markdown.join("\n\n")}\n` : "");
-	return out;
+	writeJson(sidecar, { mabillon: metadata, pages });
+	return { sidecar };
 }
 
 function writeExtraction(
@@ -257,9 +257,12 @@ function writeExtraction(
 	state: DocState,
 	schema: LoadedSchema,
 	selected: (index: number) => boolean,
+	sidecar: string,
+	store: StoreRecord | undefined,
 ): ExportResult {
 	const info = envelopeInfo(schema.schema);
 	const metadata = buildMetadata(state, schema, selected);
+	if (store) metadata.store = store;
 	const provenanceEntries: Array<Record<string, unknown>> = [];
 	const provenanceUnits: Array<Record<string, unknown>> = [];
 	const unitObjects: Array<{ unit: UnitRecord; data: Record<string, unknown>; record: Record<string, unknown> }> = [];
@@ -281,8 +284,9 @@ function writeExtraction(
 			continue;
 		}
 		try {
-			const data = JSON.parse(content) as unknown;
-			if (data && typeof data === "object" && !Array.isArray(data)) {
+			// Large integers and Python floats (`1.0`) of adopted units keep their form in the sidecar.
+			const data = pyJsonParse(content);
+			if (data && typeof data === "object" && !Array.isArray(data) && !(data instanceof PyNumberLexeme)) {
 				unitObjects.push({ unit, data: data as Record<string, unknown>, record });
 			} else {
 				record.error = "unit file is not a JSON object";
@@ -292,10 +296,7 @@ function writeExtraction(
 		}
 	}
 
-	const out: OutputPaths = {
-		json: join(paths.docDir, `${state.stem}.json`),
-		provenance: join(paths.docDir, `${state.stem}.provenance.json`),
-	};
+	const out: OutputPaths = { sidecar };
 	let merged: unknown;
 	if (info.entriesField) {
 		const entriesField = info.entriesField;
@@ -347,17 +348,18 @@ function writeExtraction(
 		// Keep the schema's property order for readability.
 		const order = Object.keys((schema.schema.properties ?? {}) as object);
 		merged = Object.fromEntries(order.filter((key) => key in result).map((key) => [key, result[key]]));
-		const validation = verifyObject(schema, merged);
+		// Validated as plain JSON values (a kept number form is a JS object until it is written out).
+		const validation = verifyObject(schema, JSON.parse(JSON.stringify(merged)));
 		const errors = validation.issues.filter((issue) => issue.severity === "error");
 		if (errors.length > 0) metadata.final_validation = errors.map(formatIssue);
 	} else {
 		merged = unitObjects.map(({ unit, data }) => ({ unit: unit.id, data }));
 	}
 	recordIntegrity(metadata, provenanceUnits);
-	writeJson(out.json, merged);
-	writeJson(out.provenance as string, {
+	writeJson(sidecar, {
 		mabillon: metadata,
-		work_dir: relative(paths.docDir, paths.workDir),
+		merged,
+		work_dir: relative(dirname(sidecar), paths.workDir).split(sep).join("/"),
 		entries: provenanceEntries,
 		units: provenanceUnits,
 	});
@@ -365,18 +367,24 @@ function writeExtraction(
 }
 
 export interface ExportResult extends OutputPaths {
-	/** Schema errors of the merged extraction output (also in the provenance metadata as final_validation). */
+	/** Schema errors of the merged extraction output (also in the sidecar metadata as final_validation). */
 	finalValidation?: string[];
 }
 
-/** Assemble the final outputs of a document from the committed copies of its finished units. */
+/**
+ * Write the sidecar `<stem>.mabillon.json` of a document from the committed copies of its finished units: the run
+ * metadata with the pages (transcription), or with the merged object, its entries' provenance and the units
+ * (extraction). The rendered files and the store rows are written by `chrono/document.ts`.
+ */
 export function writeOutputs(
 	paths: DocPaths,
 	state: DocState,
 	schema: LoadedSchema,
 	selected: (index: number) => boolean = () => true,
+	sidecar: string = join(paths.docDir, `${state.stem}.mabillon.json`),
+	store?: StoreRecord,
 ): ExportResult {
 	return state.mode === "transcribe"
-		? writeTranscription(paths, state, schema, selected)
-		: writeExtraction(paths, state, schema, selected);
+		? writeTranscription(paths, state, schema, selected, sidecar, store)
+		: writeExtraction(paths, state, schema, selected, sidecar, store);
 }

@@ -74,7 +74,8 @@ async function runWith(
 		log: () => {},
 		services: { modelRuntime: faux.modelRuntime, agentDir: faux.agentDir, settings: {}, pythonRunner },
 	});
-	return { summary, workDir: join(root, "out", "book", "work"), runDir: join(root, "out", "book", "run") };
+	const docDir = summary.documents[0]?.workingDir ?? join(root, "out", ".mabillon", "book");
+	return { summary, workDir: join(docDir, "work"), runDir: join(docDir, "run") };
 }
 
 function hasPython(): boolean {

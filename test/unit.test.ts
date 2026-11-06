@@ -219,15 +219,29 @@ describe("discovery and context", () => {
 		expect(transcribe.documents.map((doc) => doc.stem).sort()).toEqual(["book", "notes"]);
 		expect(transcribe.skipped.some((skip) => skip.path.endsWith("recipes.md"))).toBe(true);
 		const imageDoc = transcribe.documents.find((doc) => doc.stem === "book")!;
-		expect(imageDoc.images?.map((path) => basename(path))).toEqual(["page2.png", "page10.png"]);
+		// The pages are ChronoTranscriber's page list of the folder: every image in it, in natural order.
+		expect(imageDoc.images?.map((path) => basename(path))).toEqual(["context-hand.png", "page2.png", "page10.png"]);
 		const extract = discoverDocuments([root], "extract");
 		expect(extract.documents.map((doc) => doc.kind).sort()).toEqual(["images", "pdf", "text"]);
-		const context = resolveContext(imageDoc, mergeConfig());
+		// Context comes from beside the folder, with ChronoTranscriber's sidecar as the most specific one.
+		writeFileSync(join(root, "book_transcr_context.txt"), "Printed in Basel.");
+		writeFileSync(join(root, "book_extract_context.txt"), "Recipes only.");
+		const context = resolveContext(imageDoc, mergeConfig(), "transcribe");
 		expect(context.texts.map((text) => text.content)).toEqual([
 			"Corpus: English cookery books.",
 			"This book is printed in roman type.",
+			"Printed in Basel.",
 		]);
-		expect(context.images.map((path) => basename(path))).toEqual(["context-hand.png"]);
+		expect(context.images).toEqual([]);
+		expect(resolveContext(imageDoc, mergeConfig(), "extract").texts.map((text) => text.content)).toContain(
+			"Recipes only.",
+		);
+		// The tools' sidecars are never documents.
+		expect(
+			discoverDocuments([root], "extract")
+				.documents.map((doc) => doc.kind)
+				.sort(),
+		).toEqual(["images", "pdf", "text"]);
 	});
 
 	it("gives every document of an output folder a distinct stem, even against suffixed names", () => {
@@ -286,13 +300,17 @@ describe("table conversion", () => {
 });
 
 describe("chunking safety", () => {
-	it("never splits a surrogate pair at a hard cut", () => {
-		const text = `a${"\u{1F600}".repeat(600)}`;
+	it("keeps chunks whole-line ranges, an overlong line as a chunk of its own", () => {
+		const long = `a${"\u{1F600}".repeat(600)}`;
+		const text = ["Short line one.", "", long, "", "Short line five."].join("\n");
 		const { chunks } = chunkText(text, 100);
-		expect(chunks.length).toBeGreaterThan(1);
-		const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-		for (const chunk of chunks) expect(lone.test(chunk.text)).toBe(false);
-		expect(chunks.map((chunk) => chunk.text).join("")).toBe(text);
+		expect(chunks.map((chunk) => [chunk.startLine, chunk.endLine])).toEqual([
+			[1, 2],
+			[3, 3],
+			[4, 5],
+		]);
+		expect(chunks[1].text).toBe(long);
+		for (let i = 1; i < chunks.length; i++) expect(chunks[i].startLine).toBe(chunks[i - 1].endLine + 1);
 	});
 
 	it("rejects line ranges that are out of order or overlap", () => {

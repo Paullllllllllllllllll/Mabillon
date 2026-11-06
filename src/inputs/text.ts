@@ -338,36 +338,10 @@ interface Segment {
 	line: number;
 }
 
-/** Split a line longer than `maxChars` at sentence ends or spaces; every piece keeps the source line number. */
-function splitLongLine(text: string, line: number, maxChars: number): Segment[] {
-	if (text.length <= maxChars) return [{ text, line }];
-	const pieces: Segment[] = [];
-	let rest = text;
-	while (rest.length > maxChars) {
-		const window = rest.slice(0, maxChars);
-		let cut = -1;
-		const sentence = /[.!?;:]["'”’)\]]?\s/g;
-		for (let match = sentence.exec(window); match; match = sentence.exec(window)) {
-			if (match.index > maxChars * 0.5) cut = match.index + match[0].length;
-		}
-		if (cut < 0) {
-			const space = window.lastIndexOf(" ");
-			cut = space > maxChars * 0.5 ? space + 1 : maxChars;
-			// A hard cut must not separate the two halves of a surrogate pair.
-			const code = rest.charCodeAt(cut - 1);
-			if (cut === maxChars && code >= 0xd800 && code <= 0xdbff) cut--;
-		}
-		pieces.push({ text: rest.slice(0, cut).replace(/\s+$/, ""), line });
-		rest = rest.slice(cut);
-	}
-	if (rest.length > 0) pieces.push({ text: rest, line });
-	return pieces;
-}
-
 /**
  * Chunk text into units of roughly `chunkTokens` tokens (estimated as 4 characters per token), cutting at the
- * best semantic boundary in the last 40% of each chunk. Chunk line numbers refer to `text`; a line longer than a
- * chunk is split at sentence ends or spaces, and its pieces keep that line's number.
+ * best semantic boundary in the last 40% of each chunk. Chunks are whole-line ranges of `text`, as ChronoMiner's
+ * chunks are: a line longer than a chunk is a chunk of its own.
  */
 export function chunkText(text: string, chunkTokens: number): { chunks: TextChunk[]; lines: string[] } {
 	const budget = Math.max(400, Math.round(chunkTokens * 4));
@@ -375,7 +349,7 @@ export function chunkText(text: string, chunkTokens: number): { chunks: TextChun
 	const trimmed = text.replace(/\s+$/, "");
 	const lines = trimmed.split("\n");
 	if (trimmed.trim() === "") return { chunks: [], lines };
-	const segments = lines.flatMap((line, index) => splitLongLine(line, index + 1, budget));
+	const segments: Segment[] = lines.map((line, index) => ({ text: line, line: index + 1 }));
 	const texts = segments.map((segment) => segment.text);
 	const chunks: TextChunk[] = [];
 	const push = (start: number, end: number) =>
@@ -414,6 +388,19 @@ export function chunkText(text: string, chunkTokens: number): { chunks: TextChun
 		start = best;
 	}
 	return { chunks, lines };
+}
+
+/**
+ * Refuse a text with a line of more than four chunks (`chunk_tokens` at 4 characters per token): chunks are whole
+ * lines, and the agent is shown such a chunk whole, also as the context of the chunk before it.
+ */
+export function checkLineLengths(lines: string[], chunkTokens: number): void {
+	const limit = 4 * Math.max(400, Math.round(chunkTokens * 4));
+	const index = lines.findIndex((line) => line.length > limit);
+	if (index < 0) return;
+	throw new Error(
+		`line ${index + 1} has ${lines[index].length.toLocaleString("en-US")} characters (about ${Math.round(lines[index].length / 4).toLocaleString("en-US")} tokens), more than four chunks of chunk_tokens ${chunkTokens}; chunks keep whole lines, so wrap the line or convert the file (for example pretty-print JSON) before extracting`,
+	);
 }
 
 /** Gaps, overlaps and missing lines in a set of line ranges (each would drop or duplicate source text). */

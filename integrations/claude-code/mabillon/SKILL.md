@@ -30,10 +30,17 @@ mabillon schemas --json                     # list available schemas
   verify errors); 2 usage, configuration, or credential error; 3 finished, but some
   units were closed for human review; 130 interrupted. Rerunning the same command
   resumes from the last committed unit.
-- Outputs go to `mabillon_output/<stem>/` next to each input (or `--out <dir>`):
-  `<stem>.json` plus `<stem>.md` (transcription) or `<stem>.provenance.json`
-  (extraction). The `--json` result lists the exact paths per document, with
-  `status` (`complete`, `needs_review`, `incomplete`, `failed`).
+- Outputs are ChronoTranscriber's or ChronoMiner's, beside each input or under
+  `--out <dir>` (`--layout`, `--formats` as in those tools): `<name>.txt` (and
+  `<name>.md` with `--formats txt,md`; transcription) or `<stem>_output.json`
+  and, with `--formats json,csv`, `<stem>_output.csv` (extraction), with the
+  tool's store
+  (`chronotranscriber.sqlite`, `chronominer.sqlite`) in the output root and a
+  sidecar (`<name>.mabillon.json`, for extractions `<stem>_output.mabillon.json`)
+  with run metadata, per-page objects or the merged extraction. Working files go to
+  `<output root>/.mabillon/`. The `--json` result
+  lists the exact paths per document, with `status` (`complete`, `needs_review`,
+  `incomplete`, `failed`).
 - Useful options: `--units 1-20` (page/chunk selection), `--units-per-session 20`,
   `--image-quality max|high|standard`, `--context notes.md`,
   `--context-image sample.png`, `--force` (start over), `--redo-review`,
@@ -52,21 +59,23 @@ mabillon schemas --json                     # list available schemas
 2. Start with a small selection (`--units 1-3`) to check quality and cost before a
    full run. Later runs without `--units` continue with the remaining pages.
 3. Transcribe first, then extract from the transcript:
-   `mabillon extract <out>/<stem>/<stem>.md --schema <name>`.
+   `mabillon extract <name>.txt --schema <name>` (the path the transcription's
+   `--json` result lists).
 4. Give context when you know it (language, period, typeface or hand, layout
    conventions): write it to a .md file and pass `--context`, or place
    `<stem>.context.md` next to the input.
 5. Units listed under `units_needs_review` were closed without a passing
    verification (the reason is given); report them to the user rather than
    presenting the output as clean. Pass on any `warnings` (encoding problems, gaps in
-   line ranges). In extractions, check `final_validation` in the provenance file;
-   fields listed under `varying_fields` (e.g. a page's city heading) are per entry in
-   the provenance's `unit_fields`, not in the merged JSON.
+   line ranges). In extractions, check `final_validation` in the sidecar's
+   `mabillon` metadata; fields listed under `varying_fields` (e.g. a page's city
+   heading) are per entry in the sidecar's `entries[].unit_fields`, not in `merged`.
 6. The model and credentials come from pi's configuration (`~/.pi/agent`). If the
    result says no model is available or the credentials were rejected (exit code 2),
    ask the user to run `mabillon tui` and `/login`, or to pass `--model`.
 7. Do not run two commands on the same document at once; the second one fails with a
-   lock message.
+   lock message. A document that ChronoTranscriber or ChronoMiner is working on in
+   the same store is refused while that run holds its lease.
 
 ## Permissions
 

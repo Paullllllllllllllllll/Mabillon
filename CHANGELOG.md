@@ -1,5 +1,42 @@
 # Changelog
 
+- **v0.10.0** (6 November 2026) -- Breaking: Mabillon writes the outputs of
+  ChronoTranscriber (`transcribe`) and ChronoMiner (`extract`) instead of
+  `chronoagent_output/<stem>/`. Transcriptions become `<name>.txt` (and
+  `<name>.md` with `--formats txt,md`), extractions `<stem>_output.json` and
+  optionally `<stem>_output.csv`, each byte-identical to the tool's own
+  rendering, with the tool's names, layouts and default formats beside the input
+  or under `--out` (new options `--layout` and `--formats`). Every
+  output root gets the tool's store, `chronotranscriber.sqlite` or
+  `chronominer.sqlite`, created with the tools' exact schema (core v2,
+  classifications v1, chronotranscriber or chronominer v3) through Node's built-in
+  `node:sqlite`, so that the tools' `render`, `drop`, `repair`, classification and
+  resume commands accept Mabillon's documents: documents, all units (unworked ones
+  `pending`, units closed for review `failed`), runs, artifacts, outputs, held and
+  renewed leases, and for ChronoMiner the entry rows, the `entries` view and the
+  document metadata. Before it deletes or changes anything, a run refuses stores of
+  other schema versions, documents under an unexpired lease or awaiting a batch,
+  and outputs whose names collide; without `--force` it also refuses documents of
+  another input, ChronoMiner chunks of another schema and changed unit layouts. It
+  keeps files edited by hand unless `--force` and reports the document as failed
+  then or when its files cannot be replaced, adopts units another tool has already
+  finished, and works a unit again whose row another tool reset, failed or marked
+  stale since Mabillon exported it. `--force` never deletes the working folder of
+  another input or mode. Python floats such as
+  `1.0` in adopted entries keep their form in the CSV. The run metadata, per-page
+  objects and merged extraction move into a sidecar (`<name>.mabillon.json`, for
+  extractions `<stem>_output.mabillon.json`), the working files into
+  `<output root>/.mabillon/<name>/` (`<stem>_output` for extractions), which
+  ChronoTranscriber's and ChronoMiner's discovery now skip. Image folders list all
+  their pages as ChronoTranscriber does, and a page Mabillon cannot decode refuses
+  the folder; context comes from beside a folder, now including the tools'
+  `_transcr_context` and `_extract_context` sidecars. Text chunks are whole lines,
+  and a text with a line longer than four chunks is refused. ChronoMiner stores an
+  image folder as one document per image and a converted input (HTML, DOCX, EPUB)
+  with its converted text, `<stem>.txt`, as input; a multi-page TIFF is refused
+  for extraction. `test/interop/check.py` checks the outputs with the tools' own
+  code. Earlier runs are neither resumed nor converted: a document whose earlier
+  run state is still in place stops with a message naming the folder.
 - **v0.9.1** (31 October 2026) -- First public release. The bundled extraction
   schemas are now ChronoMiner's eight example schemas (`PriceListEntries`,
   `BibliographicCatalogueEntries` and others); the earlier project schemas and their

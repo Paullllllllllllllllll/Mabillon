@@ -1,4 +1,4 @@
-# Mabillon v0.9.1
+# Mabillon v0.10.0
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 
@@ -9,7 +9,10 @@ It is built on the
 [pi](https://github.com/earendil-works/pi) agent harness (pinned to
 `@earendil-works/pi-coding-agent` 1.0.0) and reuses the JSON schema format of
 ChronoTranscriber and ChronoMiner (`{name, strict, schema}` wrappers, the
-`{contains_no_content_of_requested_type, entries}` envelope).
+`{contains_no_content_of_requested_type, entries}` envelope). Its outputs are those
+of the two tools: rendered files with their names and layouts, and the
+`chronotranscriber.sqlite` and `chronominer.sqlite` stores that their `render`,
+`drop`, `repair` and resume commands read.
 
 Instead of one model call per page, a single agent works through a document page by
 page (or chunk by chunk) with a deliberately small tool set: it looks at the page,
@@ -24,12 +27,12 @@ transcription quality has to be judged on your own material.
 
 | Mode | Input | Unit | Output |
 | --- | --- | --- | --- |
-| `transcribe` | PDFs, image folders, single images, multi-page TIFFs | page | per-page objects validated against a transcription schema, plus Markdown |
-| `extract` | PDFs and images (read as images; any text layer is ignored) | page | one object validated against an extraction schema, plus provenance |
-| `extract` | text: .txt, .md, .csv, .tsv, .json, .xml/TEI, .html, .docx, .epub | chunk (about 2,500 tokens, cut at semantic boundaries) | same |
+| `transcribe` | PDFs, image folders, single images, multi-page TIFFs | page | ChronoTranscriber's `.txt` (and `.md`) and store, from pages validated against a transcription schema |
+| `extract` | PDFs and images (read as images; any text layer is ignored) | page | ChronoMiner's `_output.json` (and `_output.csv`) and store, from entries validated against an extraction schema |
+| `extract` | text: .txt, .md, .csv, .tsv, .json, .xml/TEI, .html, .docx, .epub | chunk (about 2,500 tokens, cut at semantic boundaries between lines) | same |
 
 The modes are separate on purpose. To extract from your own transcriptions, run
-`transcribe` first and then `extract` on the resulting `.md` file.
+`transcribe` first and then `extract` on the resulting `.txt` or `.md` file.
 
 ## Installation
 
@@ -113,21 +116,21 @@ mabillon transcribe book.pdf --model openai/gpt-6-luna --thinking medium
 # Transcribe a folder of page scans, 20 pages per agent session
 mabillon transcribe scans/book_1747/ --units-per-session 20
 
-# Extract price-list entries from the transcription produced above
-mabillon extract mabillon_output/book/book.md --schema PriceListEntries
+# Extract price-list entries from the transcription produced above (book.txt beside book.pdf)
+mabillon extract book.txt --schema PriceListEntries --formats json,csv
 
-# Extract catalogue records directly from page images, first 40 pages only
-mabillon extract catalogue.pdf --schema BibliographicCatalogueEntries --units 1-40
+# Extract catalogue records directly from page images, first 40 pages only, into out/
+mabillon extract catalogue.pdf --schema BibliographicCatalogueEntries --units 1-40 --out out
 
 # Validate any file against a schema (no model involved)
-mabillon verify mabillon_output/book/book.json
+mabillon verify book.mabillon.json
 mabillon verify entries.json --schema BibliographicCatalogueEntries --source catalogue.docx
 
 # List bundled and user schemas
 mabillon schemas
 
 # Progress of runs (reads their state; no model involved)
-mabillon status mabillon_output/
+mabillon status out/
 ```
 
 `mabillon --help` lists every option. All options except `--json`, `--quiet`,
@@ -157,15 +160,27 @@ context:
 
 ## How a run works
 
-1. Inputs are resolved into documents. A folder that directly contains images is one
-   document (pages in natural sort order; each page of a multi-page TIFF is a unit,
-   while directories the file marks as reduced-resolution copies, such as pyramid
-   levels and thumbnails, are skipped). PDFs and text files in the same folder are
-   separate documents, and subfolders are searched the same way (up to eight levels;
-   hidden folders, Mabillon output folders, and the `--out` folder are skipped).
-   Documents whose names collide get distinct output folders.
-2. Each document gets an output folder `mabillon_output/<stem>/` next to the input
-   (or under `--out`), with the final files at the top.
+1. Inputs are resolved into documents. A folder that directly contains images (other
+   than context images) is one document; its pages are all the images
+   ChronoTranscriber would list (natural sort order with the file name as
+   tie-break, hidden files included). A page in a format Mabillon cannot decode
+   (BMP, JPEG 2000, PNM) refuses the document with its file name. Each page of a
+   multi-page TIFF is a unit, while directories the file marks as reduced-resolution
+   copies, such as pyramid levels and thumbnails, are skipped. PDFs and text files in
+   the same folder are separate documents, and subfolders are searched the same way
+   (up to eight levels; hidden folders, `.mabillon` working folders, the `--out`
+   folder, and the files and stores of the Chrono tools are skipped). Documents whose
+   outputs would share a file name, also when the names differ only in case and
+   also two images of one folder in extraction, are refused before any agent work.
+   So is a text with a line longer than four chunks (`chunk_tokens` at four
+   characters per token), since chunks keep whole lines.
+2. Each document's outputs go where ChronoTranscriber (`transcribe`) or ChronoMiner
+   (`extract`) would put them, beside the input or under `--out` (see
+   [Outputs](#outputs)). Its working files go to `.mabillon/<name>/` in the same
+   output root, where `<name>` is the transcription's document name or, for an
+   extraction, the ChronoMiner name with `_output` (`.mabillon/book/` and
+   `.mabillon/book_output/`; an image folder takes its mirrored path, such as
+   `.mabillon/A/scan_output/`), so the two modes never share working files.
 3. The document is split into units: pages `p0001, p0002, ...` (PDF pages are
    rendered at 300 DPI on demand) or text chunks `c0001, ...`.
 4. One agent session handles up to `units_per_session` units (default 20). When it is
@@ -411,14 +426,17 @@ start).
 Text documents are cut into chunks of about `chunk_tokens` tokens at the best nearby
 boundary: a heading, a title after a blank line, a paragraph break, or at least a
 sentence end (never before a line that continues a sentence when a better cut
-exists). Overlong lines are split without changing the line numbering. HTML, DOCX, and
+exists). A chunk always consists of whole lines, so a line longer than `chunk_tokens`
+is a chunk of its own; ChronoMiner records each chunk as a line range. HTML, DOCX, and
 EPUB are converted to Markdown without escaping the text; tables become pipe tables
 with empty cells kept, lines within a cell separated by `<br>`, and captions above the
 table; superscripts and subscripts stay marked (`<sup>`,
 `<sub>`); merged cells (`colspan`, `rowspan`) leave empty cells so the other values
 keep their columns, and DOCX conversion messages are reported as warnings. Line
-numbers are those of the converted text (`run/text/document.txt`,
-identical to the file for .txt and .md inputs). Legacy encodings (Windows-1252,
+numbers are those of the converted text (`.mabillon/<stem>_output/run/text/<stem>.txt`,
+identical to the file for .txt and .md inputs); for converted inputs, ChronoMiner's
+store records this text as the document's input, and its stem keeps the document
+name when ChronoMiner resumes it. Legacy encodings (Windows-1252,
 UTF-16 without byte order mark, stray legacy bytes in UTF-8) are detected. A
 ChronoMiner `<stem>_line_ranges.txt` next to a .txt or .md input (for example after
 ChronoMiner's semantic boundary adjustment) is used instead of automatic chunking;
@@ -464,34 +482,76 @@ with the previous and next page.
 Errors block the commit; warnings are recorded with the unit and in the outputs. The
 same checks are available without a model via `mabillon verify`, which also reads
 the schema recorded next to Mabillon outputs and applies the unit checks to every
-page of an exported transcription `<stem>.json`. The recorded schema takes precedence
+page of an exported transcription `<stem>.mabillon.json`. The recorded schema takes precedence
 over a `schema:` in `mabillon.yaml`; only `--schema` on the command line overrides
 it. A file that is not valid UTF-8 fails with an error.
 
 ## Outputs
 
-Transcription (`mabillon_output/<stem>/`):
+Mabillon writes the files and the store that ChronoTranscriber (`transcribe`) or
+ChronoMiner (`extract`) would write for the same input and options, so that
+either tool can render, drop, repair, classify or resume the documents. Without
+`--out` the outputs go beside each input, and the input's folder is the output
+root; with `--out` the output root is that folder, and `--layout` places the files
+below it as the tool's own option of that name does.
 
-- `<stem>.json`: `{mabillon: {...run metadata...}, pages: [...]}`. Each page holds
+| Mode | Files | Store | `--layout` below `--out` | `--formats` |
+| --- | --- | --- | --- | --- |
+| `transcribe` | `<name>.txt`, `<name>.md` | `chronotranscriber.sqlite` | `hash` (default): `<name>-<hash>/<name>.txt`; `mirror`: the input's relative folder | `txt` (default), `md` |
+| `extract` | `<stem>_output.json`, `<stem>_output.csv` | `chronominer.sqlite` | `flat` (default): directly in `--out`; `mirror`: the input's relative folder | `json` (always), `csv` |
+
+The defaults are the tools' own. With `--formats txt,md` a transcription also
+writes `<name>.md`; ChronoMiner then refuses a run over that folder, since
+`<name>.txt` and `<name>.md` would share `<name>_output.json`.
+
+The rendered files are byte-identical to what the tool's `render` command produces
+from the store, and they are registered in the store's `outputs` table with their
+hashes. A file whose contents match neither its registered hash nor the new
+rendering, for example one edited by hand, is kept unless `--force` is given, and
+the document is then reported with an error, since its files are not current.
+Each store holds one document per input as the tool defines it: an image folder or
+a PDF for ChronoTranscriber; a text, a PDF or a single image for
+ChronoMiner, so that an image folder becomes one ChronoMiner document per image.
+Every unit of the document is stored, units that no run has worked yet as
+`pending`. A unit closed for human review is stored as `failed`; its draft is
+kept only in the Mabillon sidecar. The rows Mabillon writes name `mabillon` as
+their tool. A transcription of a single image file, a multi-page TIFF, or a folder
+holding one gets its files and a sidecar but no store row, with a warning, since
+ChronoTranscriber's pages differ from Mabillon's there; such a run is refused when
+the files belong to a document in the store. An extraction of a multi-page TIFF is
+refused, since ChronoMiner reads it as one image.
+
+A run opens an existing store only when its schema versions are the ones Mabillon
+writes. Before it deletes or changes anything, also under `--force`, it refuses a
+store document that another run holds an unexpired lease of (Mabillon runs
+included) or whose units await a batch. Without `--force` it also refuses a store
+document of another input, a ChronoMiner document with chunks extracted with
+another schema, and one whose units were laid out differently (other pages or line
+ranges). Units another tool has already finished in the store are adopted instead
+of being worked again, and the sidecar records them under `adopted_from` (required
+fields the store has no value for, such as `image_analysis`, are left empty). A
+unit whose row another tool has reset, failed or marked stale since Mabillon
+exported it (another run_id, status or the stale flag) is worked again. A rendered
+file that cannot be replaced fails the document. `--force` never deletes a working
+folder that holds the run of another input or of the other mode.
+
+Each document also gets a sidecar beside its rendered files, `<name>.mabillon.json`
+for a transcription and `<stem>_output.mabillon.json` for an extraction:
+
+- Transcription: `{mabillon: {...run metadata...}, pages: [...]}`. Each page holds
   the schema fields plus `unit`, `status`, `page`, and the source image or PDF page.
-- `<stem>.md`: the transcriptions in page order, each page introduced by
-  `<!-- page N (pNNNN) -->` (with "needs review" where applicable).
-
-Extraction:
-
-- `<stem>.json`: one object in the shape of the extraction schema: the entries of all
-  units concatenated in document order; other top-level fields take the first
-  non-null value of any unit.
-- `<stem>.provenance.json`: run metadata (model, tokens, cost, units needing review),
-  the unit (page or line range) of every entry, and per-unit status, entry counts,
-  top-level field values, and carry-over notes. If the merged object does not
-  validate against the schema (for example because a unit closed for review is
-  invalid), the errors are listed under `final_validation`.
+- Extraction: `{mabillon, merged, entries, units, work_dir}`. `merged` is one object
+  in the shape of the extraction schema, with the entries of all units concatenated
+  in document order (other top-level fields take the first non-null value of any
+  unit); `entries` gives the unit (page or line range) of every entry; `units` holds
+  per-unit status, entry counts, top-level field values, and carry-over notes. If
+  the merged object does not validate against the schema (for example because a
+  unit closed for review is invalid), the errors are listed under
+  `final_validation`.
 - Top-level fields that change from unit to unit, such as the running city heading of
   a guide (a field such as `active_city_or_town`), cannot be represented in the
   merged object. They are listed under `mabillon.varying_fields`, and every
-  provenance entry carries its unit's values in `unit_fields`; join the two files on
-  the entry index to use them.
+  entry in `entries` carries its unit's values in `unit_fields`.
 
 The run metadata has `complete` (every unit of the document finished) and, for runs
 limited with `--units`, `selection` with the IDs and state of the selected units.
@@ -509,10 +569,20 @@ under `issues`, and the metadata counts them (`warnings`, `units_with_warnings`)
 finished unit whose committed copy is missing or was changed is not exported: its
 record has `integrity_error`, and the next run reopens and redoes it.
 
-Working files: `work/` is the agent's workspace (`units/`, `notes.md`, `scratch/`,
-and text chunks in `source/`); `run/` holds Mabillon's own state (`state.json`,
-the canonical committed units in `committed/`, the converted text, and the pi session
-logs in `sessions/`, with page images removed unless `--keep-session-images`).
+Working files live in `<output root>/.mabillon/<name>/`, a folder that the
+discovery of Mabillon, ChronoTranscriber and ChronoMiner skips. Its `work/` is the
+agent's workspace (`units/`, `notes.md`, `scratch/`, and text chunks in `source/`);
+`run/` holds Mabillon's own state (`state.json`, the canonical committed units in
+`committed/`, the converted text, and the pi session logs in `sessions/`, with page
+images removed unless `--keep-session-images`).
+
+Runs of Mabillon before 0.10.0 wrote `<--out>/<stem>/` or, without `--out`,
+`chronoagent_output/<stem>/` beside the input, with `<stem>.json`, `<stem>.md` and
+`<stem>.provenance.json`. They are neither resumed nor converted: while such a
+folder holds a run state, a run of the same document stops with a message naming
+it. Finish the run with the earlier version, or move the folder away and run the
+document again; read old runs (such as the frozen Mabillon-eval runs) from their
+own layout.
 
 ## Schemas
 
@@ -572,9 +642,14 @@ first message of every session and again after each compaction.
 - `--context notes.md` and `--context-image sample.png` apply to every document (both
   repeatable; context text must be .md, .markdown, or .txt).
 - Picked up automatically, from general to specific: `context.md|txt` and
-  `context*.png|jpg|...` in the folder containing the document; for image folders,
-  the same files inside the folder; and `<stem>.context.md` and `<stem>.context*.png`
-  next to the document. `--no-auto-context` turns this off.
+  `context*.png|jpg|...` in the folder containing the document (for an image folder,
+  the folder beside it; images inside an image folder are always pages);
+  `<stem>.context.md` and `<stem>.context*.png` next to the document; and the
+  context sidecar the Chrono tool would read: ChronoTranscriber's
+  `<name>_transcr_context.txt` and `<name>_transcr_context_image.*` for
+  `transcribe`, ChronoMiner's `<stem>_extract_context.txt|png|...` for `extract`,
+  each beside the input or, as in the tool, beside its folder. `--no-auto-context`
+  turns this off.
 
 ## Use from Claude Code and other agents
 
@@ -591,8 +666,9 @@ nowhere with `--quiet`), and uses stable exit codes:
 | 130 | interrupted (state is saved; rerun the same command to resume) |
 
 `mabillon status` exits with 1 when it finds no runs and with 2 when the path does
-not exist. Without a path it reads the output folder set by `out:` in
-`mabillon.yaml` or `--out`. Finished units whose committed copy is missing or was
+not exist. It finds the runs in the `.mabillon` folders below the path; without a
+path it reads the output folder set by `out:` in `mabillon.yaml` or `--out`, else
+the current folder. Finished units whose committed copy is missing or was
 changed are listed as `units_damaged`; they count as pending, so the document is not
 `complete`. The outcome of the last export is kept in the state: a merged output that
 fails the schema (`final_validation`) or a failed export (`export_error`) also makes
@@ -601,8 +677,8 @@ or whose files are gone (`incomplete_reason: "export missing or stale"`).
 
 ```bash
 mabillon transcribe scans/ --json --quiet --units 1-3
-mabillon status mabillon_output/ --json
-mabillon verify mabillon_output/scans/scans.json --json
+mabillon status . --json
+mabillon verify scans.mabillon.json --json
 ```
 
 Every JSON result has `ok` and `exit_code`. Run results list each document with
@@ -635,6 +711,17 @@ npm run build
 The end-to-end tests drive the real pi agent loop with a scripted model and cover
 the unit gate, tool budgets, nudges, compaction, session handoff, PDF rendering,
 provider errors, resume checks, and extraction with grounding and carry-over.
+
+`test/interop/check.py` opens the outputs with the Chrono tools' own code: with
+`MABILLON_INTEROP_OUT=<dir>` set, `npm test -- test/interop.test.ts` writes its
+scenarios to `<dir>`, and the script, run from a ChronoTranscriber or ChronoMiner
+checkout, checks the store schema, the byte-identical rendering, the views, and the
+dry runs of `transcribe` or `extract`, `drop` and `repair`:
+
+```bash
+uv run --directory ../ChronoTranscriber python -X utf8 "$PWD/test/interop/check.py" <dir>
+uv run --directory ../ChronoMiner python -X utf8 "$PWD/test/interop/check.py" <dir>
+```
 
 ## Versioning
 

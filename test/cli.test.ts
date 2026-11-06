@@ -89,13 +89,18 @@ describe("headless CLI", () => {
 		const summary = JSON.parse(result.stdout);
 		expect(summary).toMatchObject({ ok: true, exit_code: 0, mode: "transcribe" });
 		expect(summary.documents[0]).toMatchObject({ stem: "letters", status: "complete", units_committed: 2 });
-		expect(summary.documents[0].outputs.json).toBe(join(out, "letters", "letters.json"));
+		const outputs = summary.documents[0].outputs;
+		expect(outputs.sidecar).toMatch(/[\\/]letters-[0-9a-f]{8}[\\/]letters\.mabillon\.json$/);
+		expect(outputs.txt).toBe(outputs.sidecar.replace(/\.mabillon\.json$/, ".txt"));
+		// txt alone by default, as ChronoTranscriber renders it.
+		expect(outputs.md).toBeUndefined();
+		expect(outputs.store).toBe(join(out, "chronotranscriber.sqlite"));
 
-		const status = await runCli(["status", join(out, "letters"), "--json"]);
+		const status = await runCli(["status", out, "--json"]);
 		expect(status.code).toBe(0);
 		expect(JSON.parse(status.stdout).documents[0]).toMatchObject({ complete: true, units_committed: 2 });
 
-		const verify = await runCli(["verify", summary.documents[0].outputs.json, "--json"]);
+		const verify = await runCli(["verify", outputs.sidecar, "--json"]);
 		expect(JSON.parse(verify.stdout)).toMatchObject({ ok: true, errors: 0 });
 	}, 120_000);
 

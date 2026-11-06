@@ -40,15 +40,44 @@ import {
 	unitFile,
 	unitsDigest,
 } from "./agent/state.ts";
-import { type ChronoConfig, checkToolSet, effectiveTools, type Mode, TOOL_NAMES, type ToolName } from "./config.ts";
+import {
+	type ChronoPlan,
+	ChronoSync,
+	createRegistry,
+	documentTextPath,
+	MABILLON_DIR,
+	planDocument,
+	renderWithoutStore,
+	type StoreRegistry,
+	staleError,
+} from "./chrono/document.ts";
+import { realPath } from "./chrono/paths.ts";
+import { ChronoStore } from "./chrono/store.ts";
+import {
+	type ChronoConfig,
+	checkToolSet,
+	DEFAULT_CONFIG,
+	effectiveTools,
+	type Mode,
+	outputSettings,
+	TOOL_NAMES,
+	type ToolName,
+} from "./config.ts";
 import { type ContextBundle, checkContextFiles, resolveContext } from "./context.ts";
 import { assignStems, discoverDocuments, OUTPUT_DIR_NAME, type SourceDocument } from "./inputs/discover.ts";
 import { downgradeProfile, type ImageProfile, resolveImageProfile, withMaxEdge } from "./inputs/image-profile.ts";
 import { clearImageCache, fileLoader, type PreparedImage, prepareContextImage } from "./inputs/images.ts";
 import { PdfSource } from "./inputs/pdf.ts";
-import { chunksFromLineRanges, chunkText, lineRangeIssues, loadTextDocument, type TextChunk } from "./inputs/text.ts";
+import {
+	checkLineLengths,
+	chunksFromLineRanges,
+	chunkText,
+	lineRangeIssues,
+	loadTextDocument,
+	type TextChunk,
+} from "./inputs/text.ts";
 import { tiffSubfileTypes } from "./inputs/tiff.ts";
-import { type OutputPaths, writeOutputs } from "./outputs.ts";
+import { type OutputPaths, type StoreRecord, writeOutputs } from "./outputs.ts";
 import { describePreferences, effectiveRouting, openRouterPreferences, withOpenRouterRouting } from "./routing.ts";
 import { boundaryPolicy, envelopeInfo, type LoadedSchema, resolveSchema } from "./schemas/registry.ts";
 import {
@@ -59,6 +88,7 @@ import {
 	withServiceTier,
 } from "./service-tier.ts";
 import {
+	canonicalPath,
 	ensureDir,
 	errorMessage,
 	formatUnitId,
@@ -97,7 +127,10 @@ export interface RunOptions {
 export interface DocumentResult {
 	stem: string;
 	source: string;
+	/** Folder of the rendered files and the sidecar. */
 	outputDir: string;
+	/** Mabillon's working folder of the document, `<output root>/.mabillon/<document name>/`. */
+	workingDir?: string;
 	outputs?: OutputPaths;
 	/** Units in the document and in the --units selection. */
 	units: number;
@@ -135,8 +168,24 @@ const REVIEW_STREAK_LIMIT = 3;
 const DEFAULT_RETRY_DELAYS = [15_000, 30_000, 60_000, 120_000];
 const PLAIN_TEXT_EXTENSIONS = new Set([".txt", ".md", ".markdown"]);
 
-export function outputRoot(doc: SourceDocument, config: ChronoConfig): string {
-	return config.out ?? join(dirname(doc.path), OUTPUT_DIR_NAME);
+export type DocumentStatusLabel = "complete" | "needs_review" | "incomplete" | "failed";
+
+export function documentStatus(doc: DocumentResult): DocumentStatusLabel {
+	if (doc.error) return "failed";
+	if (doc.pending > 0) return "incomplete";
+	// The merged output does not validate against the schema.
+	if (doc.finalValidation?.length) return "failed";
+	return doc.needsReview > 0 ? "needs_review" : "complete";
+}
+
+/** Exit code of a run: interrupted, credentials, failures/incomplete, review, success (in that precedence). */
+export function runExitCode(documents: DocumentResult[], interrupted: boolean, fatal: boolean): number {
+	if (interrupted) return 130;
+	if (fatal) return 2;
+	const statuses = documents.map(documentStatus);
+	if (statuses.some((status) => status === "failed" || status === "incomplete")) return 1;
+	if (statuses.includes("needs_review")) return 3;
+	return 0;
 }
 
 function documentLabel(doc: SourceDocument): string {
@@ -242,6 +291,7 @@ async function convertText(
 	const { text, warning } = await loadTextDocument(doc.path);
 	if (warning) warn(warning);
 	let { chunks, lines } = chunkText(text, config.chunkTokens);
+	checkLineLengths(lines, config.chunkTokens);
 	let uncovered: string[] | undefined;
 	// ChronoMiner line ranges (e.g. after its semantic boundary adjustment) apply to plain-text files, whose line
 	// numbering the conversion keeps.
@@ -282,9 +332,9 @@ async function checkStoredText(doc: SourceDocument, config: ChronoConfig, paths:
 	if (recorded !== undefined && recorded !== sha256Text(documentText)) {
 		refuse("the converted text differs from the text the run was started with (converter or settings changed)");
 	}
-	const stored = join(paths.textDir, "document.txt");
+	const stored = documentTextPath(paths.runDir, basename(doc.path));
 	if (!existsSync(stored) || (recorded !== undefined && sha256Text(readFileSync(stored, "utf8")) !== recorded)) {
-		refuse("the stored document text in run/text/document.txt is missing or was changed");
+		refuse(`the stored document text in ${relative(paths.docDir, stored)} is missing or was changed`);
 	}
 	if (chunks.length !== existing.units.length) refuse("the document now splits into a different number of chunks");
 	existing.units.forEach((unit, i) => {
@@ -355,8 +405,9 @@ async function buildUnits(
 	}
 	const { chunks, lines, documentText, uncovered } = await convertText(doc, config, warn, log);
 	fingerprint.text = sha256Text(documentText);
-	ensureDir(paths.textDir);
-	writeFileAtomic(join(paths.textDir, "document.txt"), documentText);
+	const textPath = documentTextPath(paths.runDir, basename(doc.path));
+	ensureDir(dirname(textPath));
+	writeFileAtomic(textPath, documentText);
 	const width = unitWidth(chunks.length);
 	const units = chunks.map((chunk) => {
 		const unit: UnitRecord = {
@@ -963,6 +1014,30 @@ function checkCompatible(existing: DocState, mode: Mode, schema: LoadedSchema, i
 	}
 }
 
+/** The system prompt the document's sessions start with (recorded by hash, and stored as the run's prompt). */
+function systemPromptFor(
+	doc: SourceDocument,
+	options: RunOptions,
+	schema: LoadedSchema,
+	inputKind: InputKind,
+	context: ContextBundle,
+	totalUnits: number,
+): string {
+	const { config, mode } = options;
+	const entries = mode === "extract" && resolveAddEntries(schema).setup !== undefined;
+	const tools = effectiveTools(config, { mode, inputKind, entries });
+	return buildSystemPrompt({
+		mode,
+		inputKind,
+		schema,
+		config,
+		tools: new Set(tools),
+		context,
+		documentLabel: documentLabel(doc),
+		totalUnits,
+	});
+}
+
 /** The experiment arm of a document: everything apart from the model that shapes the agent's work. */
 function experimentRecord(
 	doc: SourceDocument,
@@ -999,16 +1074,7 @@ function experimentRecord(
 				}
 			: {}),
 	};
-	const systemPrompt = buildSystemPrompt({
-		mode,
-		inputKind,
-		schema,
-		config,
-		tools: new Set(tools),
-		context,
-		documentLabel: documentLabel(doc),
-		totalUnits,
-	});
+	const systemPrompt = systemPromptFor(doc, options, schema, inputKind, context, totalUnits);
 	return {
 		tools,
 		...(mode === "extract" ? { boundary: boundaryPolicy(schema) } : {}),
@@ -1092,13 +1158,16 @@ async function processDocument(
 	model: Model<any> | undefined,
 	agentDir: string,
 	notices: Set<string>,
+	plan: ChronoPlan,
+	registry: StoreRegistry,
 ): Promise<DocumentResult> {
 	const { config, log, mode } = options;
-	const paths = docPaths(join(outputRoot(doc, config), doc.stem));
+	const paths = docPaths(plan.workingDir);
 	const result: DocumentResult = {
 		stem: doc.stem,
 		source: doc.path,
-		outputDir: paths.docDir,
+		outputDir: plan.outputDir,
+		workingDir: paths.docDir,
 		units: 0,
 		selected: 0,
 		committed: 0,
@@ -1117,10 +1186,40 @@ async function processDocument(
 	let release: (() => void) | undefined;
 	let pdf: PdfSource | undefined;
 	let state: DocState | undefined;
+	const sync = new ChronoSync(plan, registry, {
+		mode,
+		schema,
+		force: config.force,
+		model: model ? { provider: model.provider, model: model.id } : { provider: "unknown", model: "unknown" },
+		units: config.units,
+		log,
+		warn: runWarning,
+	});
 	try {
+		if (doc.refusal) throw new Error(doc.refusal);
+		const legacy = existsSync(join(paths.runDir, "state.json")) ? undefined : legacyRunFolder(doc, config);
+		if (legacy) {
+			throw new Error(
+				`${legacy} holds a run of Mabillon before 0.10.0, which this version neither resumes nor converts; finish it with that version, or move the folder away to start the document afresh here`,
+			);
+		}
 		ensureDir(paths.runDir);
 		release = acquireLock(paths.runDir);
+		// Leases, open batches, input identity and schema of the store documents are checked before anything is
+		// deleted or changed; --force deletes the local work only after that.
+		sync.preflight();
 		if (config.force) {
+			const previous = loadStateQuietly(paths.runDir);
+			if (previous && previous.mode !== mode) {
+				throw new Error(
+					`${paths.docDir} holds a ${previous.mode === "transcribe" ? "transcription" : "extraction"} run; --force does not replace it with this ${mode === "transcribe" ? "transcription" : "extraction"}`,
+				);
+			}
+			if (previous && canonicalPath(previous.source) !== canonicalPath(doc.path)) {
+				throw new Error(
+					`${paths.docDir} holds the run of ${previous.source}; --force does not replace it with ${doc.path}. Set --out (and --layout) to keep the two apart`,
+				);
+			}
 			rmSync(paths.workDir, { recursive: true, force: true });
 			for (const name of ["state.json", "text", "committed", "sessions"]) {
 				rmSync(join(paths.runDir, name), { recursive: true, force: true });
@@ -1133,8 +1232,11 @@ async function processDocument(
 		if (doc.kind === "pdf") pdf = await PdfSource.open(doc.path);
 		const fingerprint = sourceFingerprint(doc, config);
 		const existing = loadState(paths.runDir);
-		const context = resolveContext(doc, config);
+		const context = resolveContext(doc, config, mode);
 		let experiment: ExperimentRecord;
+		// The state is prepared here and becomes the document's state (exported at the end) only once the store
+		// accepted the document: a refused document changes neither its state nor its outputs.
+		let prepared: DocState;
 		if (existing) {
 			// Every compatibility check comes before any change to the state: a refused resume leaves the state and
 			// the outputs as they were (state stays undefined, so nothing is saved or exported).
@@ -1146,12 +1248,12 @@ async function processDocument(
 			checkExperiment(existing, experiment, paths);
 			// Runs of earlier versions recorded the digest of the schema text alone; store the current digest.
 			existing.schema.sha256 = schema.sha256;
-			state = existing;
-			state.source = doc.path;
-			if (doc.kind === "images") rebindImages(state, doc.images ?? []);
-			for (const message of reopenDamaged(paths, state)) runWarning(message);
+			prepared = existing;
+			prepared.source = doc.path;
+			if (doc.kind === "images") rebindImages(prepared, doc.images ?? []);
+			for (const message of reopenDamaged(paths, prepared)) runWarning(message);
 			if (config.redoReview) {
-				for (const unit of state.units as UnitWithStops[]) {
+				for (const unit of prepared.units as UnitWithStops[]) {
 					// Only units in the selection are re-run; resetting others would drop their drafts from the outputs.
 					if (unit.status === "needs_review" && selected(unit.index)) {
 						unit.status = "pending";
@@ -1181,7 +1283,7 @@ async function processDocument(
 				);
 			}
 			const now = new Date().toISOString();
-			state = {
+			prepared = {
 				version: 2,
 				mabillonVersion: readPackageVersion(),
 				mode,
@@ -1200,7 +1302,14 @@ async function processDocument(
 			};
 			experiment = experimentRecord(doc, options, schema, inputKind, context, built.units.length);
 		}
-		const docState = state;
+		// The store documents: input identity, open batches, leases and chunk layout are checked, every unit is
+		// planned, and units another tool finished are adopted, before any agent work.
+		sync.start(prepared, paths, {
+			prompt: systemPromptFor(doc, options, schema, inputKind, context, prepared.units.length),
+			context: context.texts.map((text) => text.content),
+		});
+		state = prepared;
+		const docState = prepared;
 		docState.experiment = experiment;
 		const persist = () => saveState(paths.runDir, docState);
 		persist();
@@ -1293,23 +1402,59 @@ async function processDocument(
 				// Committed copies changed during the run (e.g. through bash) are not exported as finished.
 				const damaged = reopenDamaged(paths, state);
 				for (const message of damaged) runWarning(message);
-				const { finalValidation, ...outputs } = writeOutputs(paths, state, schema, selected);
-				result.outputs = outputs;
+				const database = sync.databasePath();
+				const store: StoreRecord | undefined = database ? { database, documents: sync.documentNames() } : undefined;
+				const { finalValidation, ...outputs } = writeOutputs(paths, state, schema, selected, plan.sidecar, store);
 				if (finalValidation) {
 					result.finalValidation = finalValidation;
 					log(
 						`${doc.stem}: the merged output does not validate against the schema: ${finalValidation.join("; ")}`,
 					);
 				}
+				// The store rows and the rendered files (a transcription without a store row renders from its units).
+				const exported = sync.export(state, paths);
+				let hashes: Record<string, string> | undefined;
+				if (!database && plan.textOutputs) {
+					const rendered = renderWithoutStore(
+						plan,
+						state,
+						paths,
+						schema,
+						state.export?.hashes ?? {},
+						config.force,
+					);
+					exported.files.push(...rendered.report.written, ...rendered.report.unchanged);
+					exported.warnings.push(...rendered.report.warnings);
+					hashes = rendered.hashes;
+					exported.stale.push(...rendered.report.stale);
+					exported.kept.push(...rendered.report.kept);
+					if (exported.stale.length > 0 || exported.kept.length > 0) {
+						exported.error ??= staleError(exported.stale, exported.kept);
+					}
+				}
+				for (const message of exported.warnings) runWarning(message);
+				if (exported.error) result.error ??= exported.error;
+				const files = new Set(exported.files);
+				for (const output of [
+					...plan.documents.flatMap((document) => document.outputs),
+					...(plan.textOutputs ?? []),
+				]) {
+					if (!files.has(output.path)) continue;
+					const key = output.format as "txt" | "md" | "json" | "csv";
+					// An image folder's extraction has one _output.json per image; the result names the folder of them.
+					if (outputs[key] === undefined) outputs[key] = plan.documents.length > 1 ? plan.outputDir : output.path;
+				}
+				if (database) outputs.store = database;
+				result.outputs = outputs;
 				// Recorded for `status`, which reads only the state.
 				state.export = {
 					at: new Date().toISOString(),
 					...(finalValidation ? { finalValidation } : {}),
+					...(exported.error ? { error: exported.error } : {}),
 					// Tie the export to the unit state it was made from and the files it wrote.
 					unitsDigest: unitsDigest(state.units),
-					files: [outputs.json, outputs.markdown, outputs.provenance]
-						.filter((file): file is string => file !== undefined)
-						.map((file) => relative(paths.docDir, file)),
+					files: [outputs.sidecar, ...exported.files].map((file) => relative(paths.docDir, file)),
+					...(hashes ? { hashes } : {}),
 				};
 				saveState(paths.runDir, state);
 			}
@@ -1324,6 +1469,7 @@ async function processDocument(
 				}
 			}
 		}
+		sync.release();
 		release?.();
 		await pdf?.close().catch(() => undefined);
 		clearImageCache();
@@ -1366,15 +1512,93 @@ async function resolveModel(
 	return { modelRuntime, model: resolved.model, agentDir };
 }
 
+function loadStateQuietly(runDir: string): DocState | undefined {
+	try {
+		return loadState(runDir);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The folder of a run of Mabillon before 0.10.0 for this document, if one is there: `<--out>/<stem>/` or
+ * `<input folder>/chronoagent_output/<stem>/` (named mabillon_output in that version's documentation).
+ */
+function legacyRunFolder(doc: SourceDocument, config: ChronoConfig): string | undefined {
+	const roots = config.out
+		? [config.out]
+		: [join(dirname(doc.path), OUTPUT_DIR_NAME), join(dirname(doc.path), "mabillon_output")];
+	return roots.map((root) => join(root, doc.stem)).find((folder) => existsSync(join(folder, "run", "state.json")));
+}
+
+/**
+ * Refuse documents that would share an output and its store document, compared without case as the files are on
+ * Windows and macOS (ChronoMiner and ChronoTranscriber refuse them the same way).
+ */
+function checkCollisions(documents: SourceDocument[], plans: ChronoPlan[]): void {
+	// Every store document and every working folder, with the input that claims it (an image of a folder for a
+	// ChronoMiner image document, so two images of one folder are compared too).
+	const claimed = new Map<string, string>();
+	const claim = (key: string, name: string, input: string, root: string) => {
+		const first = claimed.get(key);
+		if (first !== undefined && first !== input) {
+			throw new Error(
+				`${first} and ${input} would share the output ${name} in ${root} and its store document. Rename one of them, run them separately, or set --out (and --layout) to keep them apart.`,
+			);
+		}
+		claimed.set(key, input);
+	};
+	plans.forEach((plan, index) => {
+		const root = plan.root.toLowerCase();
+		for (const document of plan.documents) {
+			claim(
+				`${plan.tool}\u0000${root}\u0000${document.name.toLowerCase()}`,
+				document.name,
+				document.image ?? documents[index].path,
+				plan.root,
+			);
+		}
+		claim(
+			`${root}\u0000${MABILLON_DIR}\u0000${plan.name.toLowerCase()}`,
+			plan.name,
+			documents[index].path,
+			plan.root,
+		);
+	});
+}
+
+/** The run's settings as the store's `runs.spec` records them: `{key: {value, source}}`. */
+function runSpec(config: ChronoConfig): Record<string, { value: unknown; source: string }> {
+	const defaults = DEFAULT_CONFIG as unknown as Record<string, unknown>;
+	return Object.fromEntries(
+		Object.entries(config as unknown as Record<string, unknown>)
+			.filter(([, value]) => value !== undefined)
+			.map(([key, value]) => [
+				key,
+				{ value, source: JSON.stringify(value) === JSON.stringify(defaults[key]) ? "default" : "settings" },
+			]),
+	);
+}
+
 export async function run(options: RunOptions): Promise<RunSummary> {
 	const { config, log, mode } = options;
 	// Configuration problems surface before any document is touched.
 	parseSelection(config.units);
 	checkContextFiles(config);
+	const output = outputSettings(config, mode);
 	const { documents, skipped } = discoverDocuments(options.inputs, mode, config.out ? [config.out] : []);
 	for (const skip of skipped) log(`skipped ${skip.path}: ${skip.reason}`);
 	if (documents.length === 0) return { documents: [], skipped };
-	assignStems(documents, (doc) => outputRoot(doc, config));
+	const outDir = config.out ? realPath(config.out) : undefined;
+	const plans = documents.map((doc) => planDocument(doc, mode, { outDir, ...output }));
+	// Stems stay unique per output folder for the logs and the legacy-run check.
+	assignStems(documents, (doc) => plans[documents.indexOf(doc)].outputDir);
+	checkCollisions(documents, plans);
+	// A store Mabillon cannot write (another version, not a store) is refused before any document is touched.
+	for (const key of new Set(plans.map((plan) => `${plan.tool}\u0000${plan.root}`))) {
+		const [tool, root] = key.split("\u0000") as [ChronoPlan["tool"], string];
+		ChronoStore.inspect(root, tool);
+	}
 	const schema = resolveSchema(config.schema, mode, config.schemasDirs);
 	if (mode === "extract" && !envelopeInfo(schema.schema).entriesField) {
 		// Units are merged by concatenating their entries; without an entries array there is no defined merge.
@@ -1421,6 +1645,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 		};
 	}
 	const notices = new Set<string>();
+	const registry = createRegistry({ command: mode, toolVersion: readPackageVersion(), spec: runSpec(config) });
 
 	const results: DocumentResult[] = new Array(documents.length);
 	let next = 0;
@@ -1430,7 +1655,17 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 			const index = next++;
 			const doc = documents[index];
 			log(`${doc.stem}: ${doc.path}`);
-			const result = await processDocument(doc, runOptions, schema, modelRuntime, model, agentDir, notices);
+			const result = await processDocument(
+				doc,
+				runOptions,
+				schema,
+				modelRuntime,
+				model,
+				agentDir,
+				notices,
+				plans[index],
+				registry,
+			);
 			results[index] = result;
 			if (result.fatal) fatalError ??= result.error;
 			if (result.error) log(`${doc.stem}: FAILED: ${result.error}`);
@@ -1447,6 +1682,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 	} finally {
 		// The sandbox's grants and proxies end with the run.
 		await resetSandbox();
+		const finished = results.filter(Boolean);
+		registry.closeAll(runExitCode(finished, options.signal?.aborted ?? false, fatalError !== undefined));
 	}
 	// Documents a fatal error or an interruption kept from starting are reported, not dropped.
 	const notStarted = documents
