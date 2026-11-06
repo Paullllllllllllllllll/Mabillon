@@ -200,10 +200,7 @@ describe("OpenRouter routing", () => {
 
 		// pi-ai's chat completions client (the copy pi uses), called the way pi's compaction calls it: no onPayload.
 		const completions = pathToFileURL(
-			join(
-				process.cwd(),
-				"node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js",
-			),
+			join(process.cwd(), "node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js"),
 		).href;
 		const { stream } = (await import(completions)) as {
 			stream: (model: unknown, context: unknown, options: unknown) => AsyncIterable<unknown>;

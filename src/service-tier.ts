@@ -14,7 +14,7 @@ export const FLEX_RETRY_DELAYS = [60_000, 120_000, 300_000, 600_000, 900_000];
 export const FLEX_TIMEOUT_MS = 900_000;
 
 /**
- * Whether the model's requests go to OpenAI's Responses API, the API-key route. The ChatGPT login of pi 1.0.0 uses
+ * Whether the model's requests go to OpenAI's Responses API, the API-key route. The ChatGPT login of pi uses
  * the same provider and API (it differs only in the credential, see checkServiceTierRoute); the legacy ChatGPT
  * backend is provider openai-codex with API openai-codex-responses.
  */

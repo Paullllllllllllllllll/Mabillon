@@ -15,19 +15,18 @@ import sharp from "sharp";
 import { afterAll } from "vitest";
 
 /**
- * pi-coding-agent ships with a shrinkwrapped copy of pi-ai, so the faux provider must be registered in that
- * copy's API registry (the one the agent session actually uses), not in the top-level package.
+ * The faux provider must be registered in the API registry of the pi-ai copy the agent session uses. That is the
+ * top-level package as long as package.json pins pi-ai and pi-coding-agent to the same version, so npm dedupes them;
+ * the check fails the tests when a nested copy appears.
  */
 export async function loadRegisterFauxProvider(): Promise<
 	(options: RegisterFauxProviderOptions) => FauxProviderRegistration
 > {
 	const root = process.cwd();
-	const nested = join(
-		root,
-		"node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
-	);
+	const nested = join(root, "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai");
+	if (existsSync(nested)) throw new Error(`pi-coding-agent has its own pi-ai (${nested}); pin both to one version.`);
 	const topLevel = join(root, "node_modules/@earendil-works/pi-ai/dist/compat.js");
-	const module = (await import(pathToFileURL(existsSync(nested) ? nested : topLevel).href)) as {
+	const module = (await import(pathToFileURL(topLevel).href)) as {
 		registerFauxProvider: (options: RegisterFauxProviderOptions) => FauxProviderRegistration;
 	};
 	return module.registerFauxProvider;

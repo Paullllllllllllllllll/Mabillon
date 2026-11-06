@@ -1,4 +1,4 @@
-# Mabillon v0.10.0
+# Mabillon v0.11.0
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 
@@ -7,7 +7,7 @@ schema-validated structured data from them. It is named after Jean Mabillon
 (1632-1707), whose *De re diplomatica* founded the critical study of documents.
 It is built on the
 [pi](https://github.com/earendil-works/pi) agent harness (pinned to
-`@earendil-works/pi-coding-agent` 1.0.0) and reuses the JSON schema format of
+`@earendil-works/pi-coding-agent` 1.5.0) and reuses the JSON schema format of
 ChronoTranscriber and ChronoMiner (`{name, strict, schema}` wrappers, the
 `{contains_no_content_of_requested_type, entries}` envelope). Its outputs are those
 of the two tools: rendered files with their names and layouts, and the
@@ -56,7 +56,7 @@ mabillon tui        # then type /login and pick a provider (e.g. ChatGPT, Claude
 API keys in the usual environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, ...) work as well.
 
-Models are named `<provider>/<id>`. pi 1.0.0 names the ChatGPT subscription login
+Models are named `<provider>/<id>`. pi names the ChatGPT subscription login
 `openai` (for example `openai/gpt-6-luna`); `openai-codex` is a separate legacy
 provider that needs its own login. Open-weight models on OpenRouter carry the
 vendor in their id, for example `openrouter/qwen/qwen3.8-27b`,

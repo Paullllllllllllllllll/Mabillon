@@ -185,10 +185,7 @@ describe("OpenAI service tier", () => {
 
 		// pi-ai's OpenAI Responses client (the copy pi uses), called the way pi's compaction calls it: no onPayload.
 		const responses = pathToFileURL(
-			join(
-				process.cwd(),
-				"node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/openai-responses.js",
-			),
+			join(process.cwd(), "node_modules/@earendil-works/pi-ai/dist/api/openai-responses.js"),
 		).href;
 		const { stream } = (await import(responses)) as {
 			stream: (model: unknown, context: unknown, options: unknown) => AsyncIterable<unknown>;

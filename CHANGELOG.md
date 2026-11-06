@@ -1,5 +1,15 @@
 # Changelog
 
+- **v0.11.0** (6 November 2026) -- The pi harness moves from 1.0.0 to 1.5.0
+  (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai`, pinned to the
+  same version so that npm installs a single pi-ai). pi's catalog now includes
+  `openai/gpt-6.1-terra`. pi validates tool arguments with its own JSON Schema
+  validator, so a model whose tool call fails validation sees pi-schema's messages
+  instead of TypeBox's, and numeric strings and single values are coerced as for
+  TypeBox tools; Mabillon's tools use plain JSON Schema features only. pi 1.5.0 no
+  longer nests its own pi-ai copy, and the tests that load pi-ai's provider clients
+  now take the top-level package and fail when a nested copy appears. Runs started
+  with an earlier version resume, but their later sessions run on the new harness.
 - **v0.10.0** (6 November 2026) -- Breaking: Mabillon writes the outputs of
   ChronoTranscriber (`transcribe`) and ChronoMiner (`extract`) instead of
   `chronoagent_output/<stem>/`. Transcriptions become `<name>.txt` (and
