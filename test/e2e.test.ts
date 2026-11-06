@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import type { DocState } from "../src/agent/state.ts";
@@ -148,7 +148,9 @@ describe("transcription", () => {
 			`<page_number>${n}</page_number>\nTo make a Tart of Hearbs.\nTake ſpinage and <unclear>parſley</unclear>, and boyle them.`;
 		expect(readFileSync(txt, "utf8")).toBe(`${[1, 2, 3, 4, 5].map(page).join("\n")}\n`);
 		expect(existsSync(join(dirname(txt), "book.md"))).toBe(false);
-		expect(output.mabillon.store.documents).toEqual([basename(dirname(txt)).concat("/book")]);
+		// Without --chrono no store is written.
+		expect(output.mabillon.store).toBeUndefined();
+		expect(existsSync(join(out, "chronotranscriber.sqlite"))).toBe(false);
 	}, 120_000);
 
 	it("closes a unit for review when the tool budget is exhausted", async () => {
@@ -305,15 +307,9 @@ describe("extraction from text", () => {
 		expect(provenance.entries).toHaveLength(6);
 		expect(provenance.entries[0].lines[0]).toBe(1);
 		expect(provenance.mabillon.final_validation).toBeUndefined();
-		// ChronoMiner's file: one record per chunk, the unit's JSON object as the answer text.
-		const records = JSON.parse(readFileSync(join(out, "cookbook_output.json"), "utf8"));
-		expect(records._chronominer_metadata).toMatchObject({
-			schema_name: "MiniRecipes",
-			total_chunks: state.units.length,
-		});
-		expect(records.records).toHaveLength(state.units.length);
-		expect(records.records[0]).toMatchObject({ custom_id: "cookbook-chunk-1", chunk_index: 1 });
-		expect(JSON.parse(records.records[0].response.output_text).entries.length).toBeGreaterThan(0);
+		// Without --chrono, _output.json is the merged object of the committed units, and no store is written.
+		expect(JSON.parse(readFileSync(join(out, "cookbook_output.json"), "utf8"))).toEqual(output);
+		expect(existsSync(join(out, "chronominer.sqlite"))).toBe(false);
 		// Chunks start at recipe titles, and each unit shows the start of the next chunk as context.
 		expect(
 			state.units.every((unit) =>

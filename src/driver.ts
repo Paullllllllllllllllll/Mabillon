@@ -1213,15 +1213,17 @@ async function processDocument(
 	let release: (() => void) | undefined;
 	let pdf: PdfSource | undefined;
 	let state: DocState | undefined;
-	const sync = new ChronoSync(plan, registry, {
-		mode,
-		schema,
-		force: config.force,
-		model: model ? { provider: model.provider, model: model.id } : { provider: "unknown", model: "unknown" },
-		units: config.units,
-		log,
-		warn: runWarning,
-	});
+	const sync = plan.chrono
+		? new ChronoSync(plan, registry, {
+				mode,
+				schema,
+				force: config.force,
+				model: model ? { provider: model.provider, model: model.id } : { provider: "unknown", model: "unknown" },
+				units: config.units,
+				log,
+				warn: runWarning,
+			})
+		: undefined;
 	try {
 		if (doc.refusal) throw new Error(doc.refusal);
 		const legacy = existsSync(join(paths.runDir, "state.json")) ? undefined : legacyRunFolder(doc, config);
@@ -1232,9 +1234,17 @@ async function processDocument(
 		}
 		ensureDir(paths.runDir);
 		release = acquireLock(paths.runDir);
+		// A run keeps the setting it started with: its files and the store would otherwise disagree. Checked before
+		// a store is touched; --force starts over in the new setting.
+		const started = config.force ? undefined : loadStateQuietly(paths.runDir);
+		if (started && (started.chrono ?? true) !== plan.chrono) {
+			throw new Error(
+				`${paths.docDir} holds a run started ${plan.chrono ? "without" : "with"} --chrono; rerun ${plan.chrono ? "without" : "with"} --chrono to resume it, or use --force to start over`,
+			);
+		}
 		// Leases, open batches, input identity and schema of the store documents are checked before anything is
 		// deleted or changed; --force deletes the local work only after that.
-		sync.preflight();
+		sync?.preflight();
 		if (config.force) {
 			const previous = loadStateQuietly(paths.runDir);
 			if (previous && previous.mode !== mode) {
@@ -1326,6 +1336,7 @@ async function processDocument(
 			prepared = {
 				version: 2,
 				mabillonVersion: readPackageVersion(),
+				chrono: plan.chrono,
 				mode,
 				inputKind,
 				source: doc.path,
@@ -1357,7 +1368,7 @@ async function processDocument(
 		}
 		// The store documents: input identity, open batches, leases and chunk layout are checked, every unit is
 		// planned, and units another tool finished are adopted, before any agent work.
-		sync.start(prepared, paths, {
+		sync?.start(prepared, paths, {
 			prompt: systemPromptFor(doc, options, schema, inputKind, context, prepared.units.length),
 			context: context.texts.map((text) => text.content),
 		});
@@ -1463,19 +1474,32 @@ async function processDocument(
 				// Committed copies changed during the run (e.g. through bash) are not exported as finished.
 				const damaged = reopenDamaged(paths, state);
 				for (const message of damaged) runWarning(message);
-				const database = sync.databasePath();
-				const store: StoreRecord | undefined = database ? { database, documents: sync.documentNames() } : undefined;
-				const { finalValidation, ...outputs } = writeOutputs(paths, state, schema, selected, plan.sidecar, store);
+				const database = sync?.databasePath();
+				const store: StoreRecord | undefined =
+					database && sync ? { database, documents: sync.documentNames() } : undefined;
+				const { finalValidation, entriesFile, varyingFields, ...outputs } = writeOutputs(
+					paths,
+					state,
+					schema,
+					selected,
+					plan.sidecar,
+					store,
+				);
 				if (finalValidation) {
 					result.finalValidation = finalValidation;
 					log(
 						`${doc.stem}: the merged output does not validate against the schema: ${finalValidation.join("; ")}`,
 					);
 				}
-				// The store rows and the rendered files (a transcription without a store row renders from its units).
-				const exported = sync.export(state, paths);
+				// The store rows and their rendered files; files without a store row are rendered from the units.
+				const exported = sync?.export(state, paths) ?? { files: [], warnings: [], stale: [], kept: [] };
 				let hashes: Record<string, string> | undefined;
-				if (!database && plan.textOutputs) {
+				if (!database && plan.renderedOutputs) {
+					if (varyingFields && !plan.chrono) {
+						runWarning(
+							`${varyingFields.join(", ")} differ between units; ${basename(plan.renderedOutputs[0].path)} holds the first value of each, the sidecar's entries[].unit_fields every entry's own`,
+						);
+					}
 					const rendered = renderWithoutStore(
 						plan,
 						state,
@@ -1483,6 +1507,7 @@ async function processDocument(
 						schema,
 						state.export?.hashes ?? {},
 						config.force,
+						entriesFile,
 					);
 					exported.files.push(...rendered.report.written, ...rendered.report.unchanged);
 					exported.warnings.push(...rendered.report.warnings);
@@ -1496,10 +1521,10 @@ async function processDocument(
 				for (const message of exported.warnings) runWarning(message);
 				if (exported.error) result.error ??= exported.error;
 				const files = new Set(exported.files);
-				for (const output of [
-					...plan.documents.flatMap((document) => document.outputs),
-					...(plan.textOutputs ?? []),
-				]) {
+				for (const output of plan.renderedOutputs ?? []) {
+					if (files.has(output.path)) outputs[output.format as "txt" | "md" | "json" | "csv"] ??= output.path;
+				}
+				for (const output of sync ? plan.documents.flatMap((document) => document.outputs) : []) {
 					if (!files.has(output.path)) continue;
 					const key = output.format as "txt" | "md" | "json" | "csv";
 					// An image folder's extraction has one _output.json per image; the result names the folder of them.
@@ -1530,7 +1555,7 @@ async function processDocument(
 				}
 			}
 		}
-		sync.release();
+		sync?.release();
 		release?.();
 		await pdf?.close().catch(() => undefined);
 		clearImageCache();
@@ -1593,8 +1618,8 @@ function legacyRunFolder(doc: SourceDocument, config: ChronoConfig): string | un
 }
 
 /**
- * Refuse documents that would share an output and its store document, compared without case as the files are on
- * Windows and macOS (ChronoMiner and ChronoTranscriber refuse them the same way).
+ * Refuse documents that would share an output, a working folder or a store document, compared without case as the
+ * files are on Windows and macOS (ChronoMiner and ChronoTranscriber refuse them the same way).
  */
 function checkCollisions(documents: SourceDocument[], plans: ChronoPlan[]): void {
 	// Every store document and every working folder, with the input that claims it (an image of a folder for a
@@ -1604,14 +1629,14 @@ function checkCollisions(documents: SourceDocument[], plans: ChronoPlan[]): void
 		const first = claimed.get(key);
 		if (first !== undefined && first !== input) {
 			throw new Error(
-				`${first} and ${input} would share the output ${name} in ${root} and its store document. Rename one of them, run them separately, or set --out (and --layout) to keep them apart.`,
+				`${first} and ${input} would share the output ${name} in ${root}. Rename one of them, run them separately, or set --out (and --layout) to keep them apart.`,
 			);
 		}
 		claimed.set(key, input);
 	};
 	plans.forEach((plan, index) => {
 		const root = plan.root.toLowerCase();
-		for (const document of plan.documents) {
+		for (const document of plan.chrono ? plan.documents : []) {
 			claim(
 				`${plan.tool}\u0000${root}\u0000${document.name.toLowerCase()}`,
 				document.name,
@@ -1625,6 +1650,10 @@ function checkCollisions(documents: SourceDocument[], plans: ChronoPlan[]): void
 			documents[index].path,
 			plan.root,
 		);
+		// Working folders of different names can still share a file (an image folder and a text in it, mirrored).
+		for (const file of [plan.sidecar, ...(plan.renderedOutputs ?? []).map((output) => output.path)]) {
+			claim(`file\u0000${file.toLowerCase()}`, basename(file), documents[index].path, dirname(file));
+		}
 	});
 }
 
@@ -1651,20 +1680,27 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 	for (const skip of skipped) log(`skipped ${skip.path}: ${skip.reason}`);
 	if (documents.length === 0) return { documents: [], skipped };
 	const outDir = config.out ? realPath(config.out) : undefined;
-	const plans = documents.map((doc) => planDocument(doc, mode, { outDir, ...output }));
+	const plans = documents.map((doc) => planDocument(doc, mode, { outDir, ...output, chrono: config.chrono }));
 	// Stems stay unique per output folder for the logs and the legacy-run check.
 	assignStems(documents, (doc) => plans[documents.indexOf(doc)].outputDir);
 	checkCollisions(documents, plans);
-	// A store Mabillon cannot write (another version, not a store) is refused before any document is touched.
 	for (const key of new Set(plans.map((plan) => `${plan.tool}\u0000${plan.root}`))) {
 		const [tool, root] = key.split("\u0000") as [ChronoPlan["tool"], string];
-		ChronoStore.inspect(root, tool);
+		// A store Mabillon cannot write (another version, not a store) is refused before any document is touched.
+		if (config.chrono) ChronoStore.inspect(root, tool);
+		// Without --chrono the files would replace ones the store registers, and the store would not learn of them.
+		else if (existsSync(join(root, DATABASE_NAMES[tool]))) {
+			throw new Error(
+				`${root} holds a ${DATABASE_NAMES[tool]}; use --chrono to write into its store, or --out to write elsewhere`,
+			);
+		}
 	}
 	// Correction mode: the drafts store must be the mode's store, at the schema versions Mabillon reads.
 	const draftsSource = config.drafts !== undefined ? resolveDrafts(config.drafts, mode) : undefined;
 	// --force replaces the output store's units before the agent works; in place, those are the drafts.
 	if (
 		draftsSource &&
+		config.chrono &&
 		config.force &&
 		plans.some(
 			(plan) => canonicalPath(join(plan.root, DATABASE_NAMES[plan.tool])) === canonicalPath(draftsSource.database),

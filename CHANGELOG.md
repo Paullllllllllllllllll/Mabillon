@@ -1,5 +1,21 @@
 # Changelog
 
+- **v0.12.0** (6 November 2026) -- Breaking: compatibility with ChronoTranscriber and
+  ChronoMiner becomes the setting `chrono` (`--chrono`, `--no-chrono`), off by
+  default, so that Mabillon works without either tool and touches no store. Without
+  it, a run renders its files from the committed units, with the names, layouts and
+  formats of 0.11.0: a transcription as before, an extraction as `<stem>_output.json`,
+  one object in the schema's shape with the entries of the committed units (units
+  closed for review stay in the sidecar), and with `--formats json,csv` the CSV of
+  those entries in ChronoMiner's format. An image folder gives one such file, and a
+  multi-page TIFF can be extracted. A top-level field whose value differs between
+  units produces a warning, since the file holds its first value. Such a run refuses
+  an output root that holds the store of its command. With `--chrono`, Mabillon
+  behaves as 0.11.0. The state records the setting, and a resume with the other
+  setting is refused before anything changes; runs of 0.10.0 and 0.11.0 resume only
+  with `--chrono`. `--drafts` works with either setting. Two documents whose sidecars
+  or rendered files would share a path are refused before any agent work. The README
+  is shorter, and its reference sections are pages in `docs/`.
 - **v0.11.0** (6 November 2026) -- The pi harness moves from 1.0.0 to 1.5.0
   (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai`, pinned to the
   same version so that npm installs a single pi-ai). pi's catalog now includes

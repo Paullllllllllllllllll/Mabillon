@@ -307,13 +307,12 @@ function writeExtraction(
 		}
 	}
 
-	const out: OutputPaths = { sidecar };
+	const out: ExportResult = { sidecar };
 	let merged: unknown;
 	if (info.entriesField) {
 		const entriesField = info.entriesField;
 		const entries: unknown[] = [];
 		const entryUnits: Array<Record<string, unknown>> = [];
-		const result: Record<string, unknown> = {};
 		for (const { unit, data, record } of unitObjects) {
 			const unitEntries = data[entriesField];
 			const count = Array.isArray(unitEntries) ? unitEntries.length : 0;
@@ -333,14 +332,9 @@ function writeExtraction(
 			// Other top-level fields: the merged output takes the first non-null value; every unit's own values are
 			// kept in the provenance.
 			const fields: Record<string, unknown> = {};
-			for (const key of info.otherFields) {
-				if (!(key in data)) continue;
-				fields[key] = data[key];
-				if ((result[key] === undefined || result[key] === null) && data[key] !== undefined) result[key] = data[key];
-			}
+			for (const key of info.otherFields) if (key in data) fields[key] = data[key];
 			if (Object.keys(fields).length > 0) record.fields = fields;
 		}
-		for (const key of info.otherFields) if (!(key in result)) result[key] = null;
 		// Fields that change from unit to unit (a page's city, section, or date) describe the entries of their unit;
 		// the merged object can hold only one value, so each provenance entry records its unit's values.
 		const varying = info.otherFields.filter((key) => {
@@ -354,11 +348,21 @@ function writeExtraction(
 				entry.unit_fields = Object.fromEntries(varying.map((key) => [key, entryUnits[index][key] ?? null]));
 			});
 		}
-		if (info.emptyFlag) result[info.emptyFlag] = entries.length === 0;
-		result[entriesField] = entries;
-		// Keep the schema's property order for readability.
-		const order = Object.keys((schema.schema.properties ?? {}) as object);
-		merged = Object.fromEntries(order.filter((key) => key in result).map((key) => [key, result[key]]));
+		merged = mergeUnits(
+			unitObjects.map(({ data }) => data),
+			entriesField,
+			info,
+			schema,
+		);
+		// The entries file of a run without a store holds the committed units; drafts closed for review stay in the
+		// sidecar only.
+		out.entriesFile = mergeUnits(
+			unitObjects.filter(({ unit }) => unit.status === "committed").map(({ data }) => data),
+			entriesField,
+			info,
+			schema,
+		);
+		if (varying.length > 0) out.varyingFields = varying;
 		// Validated as plain JSON values (a kept number form is a JS object until it is written out).
 		const validation = verifyObject(schema, JSON.parse(JSON.stringify(merged)));
 		const errors = validation.issues.filter((issue) => issue.severity === "error");
@@ -377,9 +381,39 @@ function writeExtraction(
 	return metadata.final_validation ? { ...out, finalValidation: metadata.final_validation } : out;
 }
 
+/**
+ * One object in the schema's shape from unit objects in document order: their entries concatenated, the other
+ * top-level fields from the first unit with a non-null value, in the schema's property order.
+ */
+function mergeUnits(
+	units: Array<Record<string, unknown>>,
+	entriesField: string,
+	info: ReturnType<typeof envelopeInfo>,
+	schema: LoadedSchema,
+): Record<string, unknown> {
+	const result: Record<string, unknown> = {};
+	const entries: unknown[] = [];
+	for (const data of units) {
+		const unitEntries = data[entriesField];
+		if (Array.isArray(unitEntries)) entries.push(...unitEntries);
+		for (const key of info.otherFields) {
+			if ((result[key] === undefined || result[key] === null) && data[key] !== undefined) result[key] = data[key];
+		}
+	}
+	for (const key of info.otherFields) if (!(key in result)) result[key] = null;
+	if (info.emptyFlag) result[info.emptyFlag] = entries.length === 0;
+	result[entriesField] = entries;
+	const order = Object.keys((schema.schema.properties ?? {}) as object);
+	return Object.fromEntries(order.filter((key) => key in result).map((key) => [key, result[key]]));
+}
+
 export interface ExportResult extends OutputPaths {
 	/** Schema errors of the merged extraction output (also in the sidecar metadata as final_validation). */
 	finalValidation?: string[];
+	/** Extraction: the merged object of the committed units, which a run without a store renders as `_output.json`. */
+	entriesFile?: Record<string, unknown>;
+	/** Extraction: top-level fields whose values differ between units (the merged objects hold the first). */
+	varyingFields?: string[];
 }
 
 /**

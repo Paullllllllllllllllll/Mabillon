@@ -5,7 +5,6 @@ coverage/
 .DS_Store
 test/.tmp/
 AGENTS.md
-docs/
 
 # Agent and T3 Code files (local only)
 CLAUDE.md

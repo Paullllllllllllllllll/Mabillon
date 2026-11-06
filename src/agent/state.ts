@@ -127,6 +127,8 @@ export interface DraftRecord {
 }
 
 export interface DocState {
+	/** The run writes ChronoTranscriber's or ChronoMiner's files and store (--chrono); absent in states of 0.10 and 0.11, which all did. */
+	chrono?: boolean;
 	/** Correction mode: the drafts store document; `ranges` when its ChronoMiner chunks gave the units. */
 	drafts?: { store: string; document: string; ranges?: boolean };
 	version: 2;
@@ -152,8 +154,8 @@ export interface DocState {
 	uncoveredLines?: string[];
 	/**
 	 * Outcome of the last export (read by `status`): schema errors of the merged output, or why it failed, the unit
-	 * state it was made from (`unitsDigest`), the files written (relative to the document's working folder) and, for a
-	 * transcription without a store row, the hashes of its text files (the overwrite guard's record).
+	 * state it was made from (`unitsDigest`), the files written (relative to the document's working folder) and, for
+	 * files rendered without a store row, their hashes (the overwrite guard's record).
 	 */
 	export?: {
 		at: string;

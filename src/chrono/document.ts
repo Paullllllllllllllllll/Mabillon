@@ -4,7 +4,7 @@ import { committedPath } from "../agent/runtime.ts";
 import { type DocPaths, type DocState, sha256Text, type UnitRecord, unitFile } from "../agent/state.ts";
 import type { Mode } from "../config.ts";
 import type { SourceDocument } from "../inputs/discover.ts";
-import type { LoadedSchema } from "../schemas/registry.ts";
+import { envelopeInfo, type LoadedSchema } from "../schemas/registry.ts";
 import { writeFileAtomic } from "../util.ts";
 import { parseTranscriptionUnit } from "../verify/rules.ts";
 import { inputIdentity } from "./identity.ts";
@@ -20,7 +20,14 @@ import {
 	type TranscriptionLayout,
 } from "./paths.ts";
 import { PyNumberLexeme, pyJsonDumps, pyJsonParse, pyStem, pyStrip } from "./py.ts";
-import { documentMetadata, renderCsv, renderOutputJson, writeEntries, writeMetadata } from "./render-cm.ts";
+import {
+	documentMetadata,
+	renderCsv,
+	renderEntriesCsv,
+	renderOutputJson,
+	writeEntries,
+	writeMetadata,
+} from "./render-cm.ts";
 import {
 	detectCause,
 	NO_TEXT_PLACEHOLDER,
@@ -89,6 +96,8 @@ export interface OutputOptions {
 	outDir?: string;
 	layout: string;
 	formats: string[];
+	/** Write the tool's store (--chrono); otherwise every file is rendered from the units. */
+	chrono: boolean;
 }
 
 export interface StoreDocPlan {
@@ -111,10 +120,15 @@ export interface ChronoPlan {
 	/** Folder of the rendered files and the sidecar. */
 	outputDir: string;
 	sidecar: string;
-	/** Candidate store documents (CM image folders: one per readable image). */
+	/** The run writes the tool's store (--chrono). */
+	chrono: boolean;
+	/** Candidate store documents (CM image folders: one per readable image); also read for --drafts without a store. */
 	documents: StoreDocPlan[];
-	/** Text formats of a transcription without a store row (rendered from the units alone). */
-	textOutputs?: Array<{ format: string; path: string }>;
+	/**
+	 * Files rendered from the units alone, without a store row: every file of a run without --chrono, and with it the
+	 * text files of a transcription of a single image or a multi-page TIFF.
+	 */
+	renderedOutputs?: Array<{ format: string; path: string }>;
 }
 
 /** The text formats a transcription renders (`text_formats`): txt and md in the given order, txt when none. */
@@ -155,6 +169,7 @@ export function planDocument(doc: SourceDocument, mode: Mode, options: OutputOpt
 		const storable = doc.kind === "pdf" || isFolder;
 		return {
 			tool: "chronotranscriber",
+			chrono: options.chrono,
 			root: location.root,
 			name: location.name,
 			workingDir: join(location.root, MABILLON_DIR, ...location.name.split("/")),
@@ -171,7 +186,7 @@ export function planDocument(doc: SourceDocument, mode: Mode, options: OutputOpt
 						},
 					]
 				: [],
-			textOutputs: storable ? undefined : outputs,
+			renderedOutputs: storable && options.chrono ? undefined : outputs,
 		};
 	}
 	const layout = options.layout as ExtractionLayout;
@@ -189,11 +204,16 @@ export function planDocument(doc: SourceDocument, mode: Mode, options: OutputOpt
 		const name = `${mirrored === "." ? basename(item) : mirrored}${EXTRACTION_SUFFIX}`;
 		return {
 			tool: "chronominer",
+			chrono: options.chrono,
 			root: probe.root,
 			name,
 			workingDir: join(probe.root, MABILLON_DIR, ...name.split("/")),
 			outputDir,
 			sidecar: join(outputDir, `${basename(item)}${EXTRACTION_SUFFIX}${SIDECAR_SUFFIX}`),
+			// Without a store the folder is one document, with one output beside its sidecar.
+			renderedOutputs: options.chrono
+				? undefined
+				: cmOutputs(join(outputDir, `${basename(item)}${CM_OUTPUT_SUFFIX}`)),
 			documents: images.map((image) => {
 				const location = cmLocation(image, { outputDir: options.outDir, layout, inputRoot });
 				return {
@@ -215,11 +235,13 @@ export function planDocument(doc: SourceDocument, mode: Mode, options: OutputOpt
 	const kind = doc.kind === "text" ? "text" : doc.kind === "pdf" ? "pdf" : "image";
 	return {
 		tool: "chronominer",
+		chrono: options.chrono,
 		root: location.root,
 		name,
 		workingDir,
 		outputDir: dirname(location.output),
 		sidecar: `${base}${EXTRACTION_SUFFIX}${SIDECAR_SUFFIX}`,
+		renderedOutputs: options.chrono ? undefined : cmOutputs(location.output),
 		documents: [
 			{
 				name: location.name,
@@ -272,7 +294,7 @@ function mapUnits(plan: ChronoPlan, state: DocState, warn: (message: string) => 
 			warn(
 				"its pages do not match ChronoTranscriber's page list of the folder (a multi-page TIFF); the text files and the sidecar are written, the store gets no row",
 			);
-			plan.textOutputs = document.outputs;
+			plan.renderedOutputs = document.outputs;
 			return mapped;
 		}
 		mapped.set(
@@ -619,8 +641,8 @@ export class ChronoSync {
 			// Files rendered from the units alone (a single image, a multi-page TIFF) belong to no store document, so
 			// they must not replace a file the store registers for one, also not under --force.
 			const database = join(plan.root, DATABASE_NAMES[plan.tool]);
-			if (plan.textOutputs && existsSync(database)) {
-				const owned = registeredOwner(this.registry.get(plan.root, plan.tool), plan.textOutputs);
+			if (plan.renderedOutputs && existsSync(database)) {
+				const owned = registeredOwner(this.registry.get(plan.root, plan.tool), plan.renderedOutputs);
 				if (owned) {
 					throw new Error(
 						`${owned.path} is a rendered file of the store document '${owned.name}' in ${database}, which this input cannot update (it has no store document of its own); set --out to write the files elsewhere`,
@@ -1191,8 +1213,10 @@ export function labelNamesImage(label: string, image: string): boolean {
 }
 
 /**
- * The text files of a transcription without a store row, rendered from its units as ChronoTranscriber would render
- * them, with the same overwrite guard; `recorded` holds the hashes of the files the last export wrote.
+ * The files of a document without a store row, with the store's overwrite guard; `recorded` holds the hashes of the
+ * files the last export wrote. A transcription's text files are rendered from its units as ChronoTranscriber would
+ * render them; an extraction writes `entriesFile` (the merged object of its committed units) and the CSV of its
+ * entries in ChronoMiner's CSV format.
  */
 export function renderWithoutStore(
 	plan: ChronoPlan,
@@ -1201,10 +1225,47 @@ export function renderWithoutStore(
 	schema: LoadedSchema,
 	recorded: Record<string, string>,
 	force: boolean,
+	entriesFile?: Record<string, unknown>,
 ): { report: RenderReport; hashes: Record<string, string> } {
 	const report = emptyReport();
 	const hashes: Record<string, string> = {};
-	if (!plan.textOutputs) return { report, hashes };
+	if (!plan.renderedOutputs) return { report, hashes };
+	const guard = (targets: RenderTarget[]) =>
+		writeGuarded(
+			targets,
+			(path) => recorded[path],
+			force,
+			(target, sha, ok) => {
+				if (ok && sha) hashes[target.path] = sha;
+			},
+			report,
+		);
+	if (state.mode === "extract") {
+		// Before any unit is committed there is nothing to write; an empty object would claim the source has no content.
+		const entriesField = envelopeInfo(schema.schema).entriesField;
+		if (!entriesFile || !entriesField || !state.units.some((unit) => unit.status === "committed")) {
+			return { report, hashes };
+		}
+		const value = entriesFile[entriesField];
+		const entries = Array.isArray(value) ? value : [];
+		guard(
+			plan.renderedOutputs.map((output) => ({
+				path: output.path,
+				format: output.format,
+				text:
+					output.format === "csv"
+						? renderEntriesCsv(
+								schema.schema,
+								entries.filter(
+									(entry): entry is Record<string, unknown> =>
+										!!entry && typeof entry === "object" && !Array.isArray(entry),
+								),
+							)
+						: `${JSON.stringify(entriesFile, null, 2)}\n`,
+			})),
+		);
+		return { report, hashes };
+	}
 	const units: RenderUnit[] = [];
 	for (const unit of state.units) {
 		if (unit.status === "pending") continue;
@@ -1221,19 +1282,12 @@ export function renderWithoutStore(
 		});
 	}
 	if (units.length === 0) return { report, hashes };
-	const targets = plan.textOutputs.map((output) => ({
-		path: output.path,
-		format: output.format,
-		text: renderUnits(units, null, output.format as TextFormat),
-	}));
-	writeGuarded(
-		targets,
-		(path) => recorded[path],
-		force,
-		(target, sha, ok) => {
-			if (ok && sha) hashes[target.path] = sha;
-		},
-		report,
+	guard(
+		plan.renderedOutputs.map((output) => ({
+			path: output.path,
+			format: output.format,
+			text: renderUnits(units, null, output.format as TextFormat),
+		})),
 	);
 	return { report, hashes };
 }

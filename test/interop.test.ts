@@ -156,7 +156,13 @@ function extractor(options: { stop?: string[] } = {}) {
 async function harness(responder: (context: TranscriptContext) => AssistantMessage, overrides: Partial<ChronoConfig>) {
 	const faux = await createFauxRuntime(responder);
 	cleanups.push(faux.cleanup);
-	const config = mergeConfig({ model: "faux/faux-1", autoContext: false, settleRetries: 0, ...overrides });
+	const config = mergeConfig({
+		model: "faux/faux-1",
+		autoContext: false,
+		settleRetries: 0,
+		chrono: true,
+		...overrides,
+	});
 	const logs: string[] = [];
 	return {
 		logs,
@@ -1330,11 +1336,64 @@ describe("mixed stores and refusals", () => {
 		writeFileSync(join(root, "out", "chronotranscriber.sqlite"), "not a database at all, but long enough".repeat(30));
 		const result = spawnSync(
 			process.execPath,
-			[join(process.cwd(), "src", "bin.ts"), "transcribe", pdf, "--out", join(root, "out"), "--json"],
+			[join(process.cwd(), "src", "bin.ts"), "transcribe", pdf, "--out", join(root, "out"), "--chrono", "--json"],
 			{ encoding: "utf8" },
 		);
 		expect(result.status).toBe(2);
 		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, exit_code: 2 });
 		expect(result.stderr).not.toMatch(/ExperimentalWarning/);
 	}, 60_000);
+});
+
+describe("without --chrono", () => {
+	it("extracts an image folder into one merged file and its CSV, without the units closed for review", async () => {
+		const root = tempDir();
+		const folder = await makeImageFolder(join(root, "in", "ledger"), 3);
+		const out = join(root, "out");
+		const schema = writePriceSchema(root);
+		const extract = extractor();
+		// p0002 is written but never verified, so it is closed for review with its draft.
+		const responder = (context: TranscriptContext): AssistantMessage => {
+			const last = context.messages[context.messages.length - 1];
+			if (currentUnit(context) === "p0002" && last.role === "toolResult" && last.toolName === "write") {
+				return say("Done with this page.");
+			}
+			return extract(context);
+		};
+		const h = await harness(responder, { out, schema, chrono: false, formats: ["json", "csv"] });
+		const summary = await h.run("extract", [folder]);
+		expect(summary.documents[0]).toMatchObject({ committed: 2, needsReview: 1 });
+		expect(summary.documents[0].outputs?.json).toBe(join(realPath(out), "ledger_output.json"));
+		const file = JSON.parse(readFileSync(join(out, "ledger_output.json"), "utf8"));
+		expect(file.contains_no_content_of_requested_type).toBe(false);
+		expect(file.entries.map((entry: { page: number }) => entry.page)).toEqual([1, 3]);
+		expect(readSidecar(out, "ledger").merged.entries).toHaveLength(3);
+		const csv = readFileSync(join(out, "ledger_output.csv"), "utf8").split("\n");
+		expect(csv[0]).toBe("﻿item,price.amount,price.currency,tags,page,checked");
+		expect(csv[1]).toBe('"Pepper, ""best"" p0001",1.5,fl,spice; unit 1,1,true');
+		expect(csv).toHaveLength(4);
+		expect(existsSync(join(out, "chronominer.sqlite"))).toBe(false);
+		expect(existsSync(join(out, "scan_1_output.json"))).toBe(false);
+	}, 120_000);
+
+	it("resumes a run only in the setting it started with, and leaves a store's output root alone", async () => {
+		const root = tempDir();
+		mkdirSync(join(root, "in"), { recursive: true });
+		const pdf = makePdf(join(root, "in", "book.pdf"), ["one", "two"]);
+		const out = join(root, "out");
+		await (await harness(transcriber(), { out, dpi: 72, chrono: false, units: "1" })).run("transcribe", [pdf]);
+		const state = join(workingDir(out, "book"), "run", "state.json");
+		const before = readFileSync(state);
+		const resumed = await (await harness(transcriber(), { out, dpi: 72 })).run("transcribe", [pdf]);
+		expect(resumed.documents[0].error).toMatch(/started without --chrono; rerun without --chrono/);
+		expect(readFileSync(state)).toEqual(before);
+		expect(existsSync(join(out, "chronotranscriber.sqlite"))).toBe(false);
+
+		const stored = join(root, "stored");
+		await (await harness(transcriber(), { out: stored, dpi: 72 })).run("transcribe", [pdf]);
+		const standalone = await harness(transcriber(), { out: stored, dpi: 72, chrono: false });
+		await expect(standalone.run("transcribe", [pdf])).rejects.toThrow(
+			/holds a chronotranscriber\.sqlite; use --chrono to write into its store/,
+		);
+	}, 120_000);
 });

@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -92,9 +92,10 @@ describe("headless CLI", () => {
 		const outputs = summary.documents[0].outputs;
 		expect(outputs.sidecar).toMatch(/[\\/]letters-[0-9a-f]{8}[\\/]letters\.mabillon\.json$/);
 		expect(outputs.txt).toBe(outputs.sidecar.replace(/\.mabillon\.json$/, ".txt"));
-		// txt alone by default, as ChronoTranscriber renders it.
+		// txt alone by default, as ChronoTranscriber renders it, and no store without --chrono.
 		expect(outputs.md).toBeUndefined();
-		expect(outputs.store).toBe(join(out, "chronotranscriber.sqlite"));
+		expect(outputs.store).toBeUndefined();
+		expect(existsSync(join(out, "chronotranscriber.sqlite"))).toBe(false);
 
 		const status = await runCli(["status", out, "--json"]);
 		expect(status.code).toBe(0);

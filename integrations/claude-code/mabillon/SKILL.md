@@ -30,17 +30,20 @@ mabillon schemas --json                     # list available schemas
   verify errors); 2 usage, configuration, or credential error; 3 finished, but some
   units were closed for human review; 130 interrupted. Rerunning the same command
   resumes from the last committed unit.
-- Outputs are ChronoTranscriber's or ChronoMiner's, beside each input or under
-  `--out <dir>` (`--layout`, `--formats` as in those tools): `<name>.txt` (and
-  `<name>.md` with `--formats txt,md`; transcription) or `<stem>_output.json`
-  and, with `--formats json,csv`, `<stem>_output.csv` (extraction), with the
-  tool's store
-  (`chronotranscriber.sqlite`, `chronominer.sqlite`) in the output root and a
-  sidecar (`<name>.mabillon.json`, for extractions `<stem>_output.mabillon.json`)
-  with run metadata, per-page objects or the merged extraction. Working files go to
-  `<output root>/.mabillon/`. The `--json` result
-  lists the exact paths per document, with `status` (`complete`, `needs_review`,
-  `incomplete`, `failed`).
+- Outputs go beside each input or under `--out <dir>` (`--layout`, `--formats`):
+  `<name>.txt` (and `<name>.md` with `--formats txt,md`) for a transcription;
+  `<stem>_output.json`, one object in the schema's shape with the entries of the
+  committed units (and `<stem>_output.csv` with `--formats json,csv`), for an
+  extraction. Each document also gets a sidecar (`<name>.mabillon.json`, for
+  extractions `<stem>_output.mabillon.json`) with run metadata, per-page objects or
+  the merged extraction including drafts closed for review. Working files go to
+  `<output root>/.mabillon/`. The `--json` result lists the exact paths per
+  document, with `status` (`complete`, `needs_review`, `incomplete`, `failed`).
+- `--chrono` writes ChronoTranscriber's or ChronoMiner's files and SQLite store
+  instead, so those tools can render, repair and resume the documents. Pass it only
+  when the user works with those tools. A run resumes only with the setting it
+  started with, and a run without `--chrono` refuses an output root that holds a
+  `chronotranscriber.sqlite` (transcription) or `chronominer.sqlite` (extraction).
 - Useful options: `--units 1-20` (page/chunk selection), `--units-per-session 20`,
   `--image-quality max|high|standard`, `--context notes.md`,
   `--context-image sample.png`, `--force` (start over), `--redo-review`,
@@ -74,8 +77,8 @@ mabillon schemas --json                     # list available schemas
    result says no model is available or the credentials were rejected (exit code 2),
    ask the user to run `mabillon tui` and `/login`, or to pass `--model`.
 7. Do not run two commands on the same document at once; the second one fails with a
-   lock message. A document that ChronoTranscriber or ChronoMiner is working on in
-   the same store is refused while that run holds its lease.
+   lock message. With `--chrono`, a document that ChronoTranscriber or ChronoMiner is
+   working on in the same store is refused while that run holds its lease.
 
 ## Permissions
 

@@ -562,14 +562,18 @@ describe("runs", () => {
 	it("refuses to resume when the source changed", async () => {
 		const root = tempDir();
 		const text = join(root, "notes.txt");
-		writeFileSync(text, "Erstes Rezept.\n\nZweites Rezept.\n");
-		const h = await harness(diligent, { out: join(root, "out"), schema: RECIPES_SCHEMA });
-		const firstRun = await h.run("extract", [text]);
-		expect(firstRun.documents[0].error).toBeUndefined();
-		writeFileSync(text, "Ganz anderer Text.\n");
-		const secondRun = await h.run("extract", [text]);
-		// The store's input identity is checked first, before anything local is changed.
-		expect(secondRun.documents[0].error).toMatch(/holds another input .*use --force/);
+		for (const chrono of [false, true]) {
+			writeFileSync(text, "Erstes Rezept.\n\nZweites Rezept.\n");
+			const h = await harness(diligent, { out: join(root, `out-${chrono}`), schema: RECIPES_SCHEMA, chrono });
+			const firstRun = await h.run("extract", [text]);
+			expect(firstRun.documents[0].error).toBeUndefined();
+			writeFileSync(text, "Ganz anderer Text.\n");
+			const secondRun = await h.run("extract", [text]);
+			// With a store, its input identity is checked first, before anything local is changed.
+			expect(secondRun.documents[0].error).toMatch(
+				chrono ? /holds another input .*use --force/ : /the source differs from the one this run was started with/,
+			);
+		}
 	}, 60_000);
 
 	it("fails a corrupt PDF without stopping the batch", async () => {

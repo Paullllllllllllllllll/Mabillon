@@ -425,6 +425,14 @@ function csvRow(fields: string[]): string {
 	return `${fields.map((field) => (/[",\r\n]/.test(field) ? `"${field.replace(/"/g, '""')}"` : field)).join(",")}\n`;
 }
 
+/** The CSV of `entries`, its columns from the schema file's entry object (else from the entries' own keys). */
+export function renderEntriesCsv(schema: Json, entries: JsonObject[]): string {
+	const columns = csvColumns(schema, entries);
+	let out = csvRow(columns.map((path) => path.join(".")));
+	for (const entry of entries) out += csvRow(columns.map((path) => cell(lookup(entry, path))));
+	return `﻿${out}`;
+}
+
 /** `render_csv`. */
 export function renderCsv(connection: Connection, docId: number): string {
 	const entries: JsonObject[] = [];
@@ -443,8 +451,5 @@ export function renderCsv(connection: Connection, docId: number): string {
 		const parsed = text === undefined ? undefined : loads(text);
 		schema = isObject(parsed) ? parsed : undefined;
 	}
-	const columns = csvColumns(schema, entries);
-	let out = csvRow(columns.map((path) => path.join(".")));
-	for (const entry of entries) out += csvRow(columns.map((path) => cell(lookup(entry, path))));
-	return `﻿${out}`;
+	return renderEntriesCsv(schema, entries);
 }

@@ -72,11 +72,15 @@ OpenRouter (models named openrouter/<vendor>/<model>):
   --openrouter-quantizations <list>
                                precisions the providers may serve (e.g. fp8,bf16)
 
-Output and runs (ChronoTranscriber's outputs for transcribe, ChronoMiner's for extract):
-  --out <dir>                  output root with the store (default: beside each input)
+Output and runs:
+  --out <dir>                  output root (default: beside each input)
+  --chrono                     write ChronoTranscriber's (transcribe) or ChronoMiner's (extract) files and
+                               store, so the tools can render, repair and resume the documents (default: off,
+                               no store is touched); a run resumes only with the setting it started with
   --layout <layout>            below --out: transcribe hash (default) or mirror; extract flat (default) or mirror
   --formats <list>             transcribe: txt (default), md; extract: json (always), csv
-  --force                      discard existing work for the documents and start over (their store units too)
+  --force                      discard existing work for the documents and start over (with --chrono, their
+                               store units too)
   --redo-review                re-run units that were closed for review
   --drafts <path>              correction mode: a chronotranscriber.sqlite (transcribe) or chronominer.sqlite
                                (extract), or an output root with it; its units of the same input seed the unit
@@ -130,6 +134,7 @@ const FLAG_ALIASES: Record<string, string> = {
 };
 
 const BOOLEAN_FLAGS = new Set([
+	"chrono",
 	"force",
 	"redoReview",
 	"verbose",

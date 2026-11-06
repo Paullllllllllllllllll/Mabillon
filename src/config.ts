@@ -19,8 +19,13 @@ export interface ChronoConfig {
 	thinking?: ThinkingLevel;
 	/** OpenAI service tier sent with every request (OpenAI API key only; flex halves the price). */
 	serviceTier?: ServiceTier;
-	/** Output root (ChronoTranscriber's or ChronoMiner's --output). Without it the outputs go beside each input. */
+	/** Output root. Without it the outputs go beside each input. */
 	out?: string;
+	/**
+	 * Write ChronoTranscriber's (transcribe) or ChronoMiner's (extract) files and store, so that the tools can render,
+	 * repair and resume the documents. Off: Mabillon's own files from the committed units, and no store is touched.
+	 */
+	chrono: boolean;
 	/** Output layout below `out`: transcription hash (default) or mirror, extraction flat (default) or mirror. */
 	layout?: string;
 	/** Rendered formats: transcription txt (default) and md, extraction json (always) and csv. */
@@ -102,6 +107,7 @@ export interface ChronoConfig {
 }
 
 export const DEFAULT_CONFIG: ChronoConfig = {
+	chrono: false,
 	schemasDirs: [],
 	unitsPerSession: 20,
 	compactAtTokens: 250_000,
@@ -137,6 +143,7 @@ const KEY_ALIASES: Record<string, keyof ChronoConfig> = {
 	servicetier: "serviceTier",
 	out: "out",
 	output: "out",
+	chrono: "chrono",
 	layout: "layout",
 	formats: "formats",
 	schema: "schema",
@@ -207,6 +214,7 @@ const POSITIVE_KEYS = new Set<keyof ChronoConfig>([
 	"concurrency",
 ]);
 const BOOLEAN_KEYS = new Set<keyof ChronoConfig>([
+	"chrono",
 	"autoContext",
 	"force",
 	"redoReview",
