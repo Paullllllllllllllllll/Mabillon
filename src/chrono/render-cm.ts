@@ -16,6 +16,8 @@ const PAGE_KINDS = new Set(["pdf", "image", "images"]);
 const COMPUTED = ["total_chunks", "partial", "failed_chunks", "version"];
 const LEADING = ["schema_name", "model_name", "chunking_method"];
 const OPTIONAL = ["chunking_text_version", "document_total_chunks", "chunk_slice"];
+/** Read from the store at render time, never from the stored metadata. */
+const IDENTITY = ["schema_version", "schema_sha256"];
 
 /** Python truthiness of a JSON value. */
 function truthy(value: Json): boolean {
@@ -54,6 +56,33 @@ export function documentMetadata(
 			? { schemaSha256: String(row.schema_sha256) }
 			: {}),
 	};
+}
+
+/**
+ * The schema keys of the output metadata: `schema_sha256` as `document_meta` records it, and `schema_version` (the
+ * top-level one of the schema file, as a string) when the stored schema text has one. A document without a recorded
+ * hash, or whose schema text is not in `artifacts`, gets neither, and neither does one whose run metadata carries
+ * `schema_unverified` (it kept done chunks from before a hash was recorded).
+ */
+export function schemaIdentity(
+	connection: Connection,
+	docId: number,
+): { schema_version?: string; schema_sha256?: string } {
+	const { metadata, schemaSha256: sha } = documentMetadata(connection, docId);
+	if (sha === undefined || truthy(metadata.schema_unverified ?? null)) return {};
+	const text = connection.get("SELECT text FROM artifacts WHERE sha256 = ?", sha)?.text;
+	if (text === undefined || text === null) return {};
+	const parsed = loads(text);
+	const version = isObject(parsed) ? parsed.schema_version : undefined;
+	const versionText =
+		typeof version === "string"
+			? version
+			: version instanceof PyNumberLexeme
+				? version.text
+				: typeof version === "number"
+					? pyNumber(version)
+					: undefined;
+	return { ...(versionText !== undefined ? { schema_version: versionText } : {}), schema_sha256: sha };
 }
 
 /** `metadata_writer`: merge `values` into the document's run metadata; a null value removes its key. */
@@ -192,6 +221,7 @@ export function renderOutputJson(connection: Connection, docId: number): string 
 			: "unknown";
 	const meta: JsonObject = {
 		schema_name: schemaName,
+		...schemaIdentity(connection, docId),
 		model_name: truthy(stored.model_name) ? stored.model_name : (latestModel ?? "unknown"),
 		chunking_method: truthy(stored.chunking_method) ? stored.chunking_method : "unknown",
 		total_chunks: total,
@@ -206,7 +236,7 @@ export function renderOutputJson(connection: Connection, docId: number): string 
 		? stored.batch_tracking
 		: batchTracking(connection, docId, String(schemaName));
 	if (truthy(tracking)) meta.batch_tracking = tracking;
-	const known = new Set([...COMPUTED, ...LEADING, ...OPTIONAL, "timestamp", "image_provenance"]);
+	const known = new Set([...COMPUTED, ...LEADING, ...IDENTITY, ...OPTIONAL, "timestamp", "image_provenance"]);
 	for (const [key, value] of Object.entries(stored)) {
 		if (!known.has(key) && key !== "batch_tracking") meta[key] = value;
 	}

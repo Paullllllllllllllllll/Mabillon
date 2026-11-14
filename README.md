@@ -1,4 +1,4 @@
-# Mabillon v0.13.0
+# Mabillon v0.14.0
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 
@@ -104,8 +104,11 @@ Working files live in `<output root>/.mabillon/<name>/`.
 By default, Mabillon touches no ChronoTranscriber or ChronoMiner store, and it refuses
 an output root that holds one. With `--chrono` (`chrono: true`), it writes into
 `chronotranscriber.sqlite` or `chronominer.sqlite`, renders the files exactly as the
-tool's own `render` command would, and adopts units that the tool finished. A run
-resumes only with the setting it started with. [docs/outputs.md](docs/outputs.md)
+tool's own `render` command would, and adopts units that the tool finished, unless
+the tool made them with another schema. A run that shares a store with
+ChronoTranscriber therefore needs that tool's own schema file, passed with
+`--schemas-dir` and its schema folder. A run resumes only with the setting it started
+with. [docs/outputs.md](docs/outputs.md)
 describes the files and the sidecar, [docs/chrono.md](docs/chrono.md) the store
 handling and the correction mode (`--drafts`), which corrects the units of an earlier
 ChronoTranscriber or ChronoMiner run.
@@ -145,7 +148,9 @@ wrappers or bare JSON Schemas, with the
 `{contains_no_content_of_requested_type, entries}` envelope for extraction. The package
 bundles a default transcription schema, copies of the tools' transcription schemas,
 and ChronoMiner's example extraction schemas. `--schema` selects one by name, file stem
-or path, and `--schemas-dir` adds your own. `mabillon schemas` lists them. See
+or path. `--schemas-dir` and `schemas_dirs` add your own folders, searched in that
+order before the bundled schemas; looking up a name that two of them hold is an error.
+`mabillon schemas` lists them. See
 [docs/schemas.md](docs/schemas.md) for rules files and the requirements on extraction
 schemas.
 

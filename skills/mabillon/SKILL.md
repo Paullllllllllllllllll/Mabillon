@@ -91,7 +91,9 @@ read it before a run, or pass `--config` with an empty file. `--no-force`,
   store. With `--chrono`, a document another tool's run holds is refused while that
   run's lease lasts; a killed run's lease expires after ten minutes. Units the other
   tool finished in the store are adopted as they stand, without Mabillon's checks;
-  correction mode (`--drafts`) has the agent check them. A single image or a
+  correction mode (`--drafts`) has the agent check them. ChronoTranscriber pages made
+  with another schema are refused (`--force` or another `--out`), and pages of unknown
+  schema are adopted with a warning in the result. A single image or a
   multi-page TIFF gets no store document, so the tool cannot render or repair it.
 - Transcribe first, then extract from the transcript: `mabillon extract <name>.txt
   --schema <name>`, with the path the transcription's result lists.
@@ -100,7 +102,12 @@ read it before a run, or pass `--config` with an empty file. `--no-force`,
   resume needs `--drafts` again.
 - Schemas: the bundled transcription and extraction schemas are copies; `--schemas-dir
   <dir>` adds a folder whose file of the same name shadows the copy, as for a run that
-  shares a store with a ChronoTranscriber or ChronoMiner run.
+  shares a store with a ChronoTranscriber or ChronoMiner run (a ChronoTranscriber store
+  needs that tool's own schema folder). `--schemas-dir` folders are searched before the
+  `schemas_dirs` of `mabillon.yaml`; looking up a schema name or file stem that two of
+  these folders hold is an error naming both files (exit code 2).
+- `verify` refuses (exit code 2) when the recorded schema file is gone or changed and
+  the recorded name finds a schema with another digest; `--schema` overrides.
 - Context about the source (language, period, script or typeface, layout) goes in a
   `.md` file passed as `--context`, or in `<stem>.context.md` beside the input.
 - `--force` discards the documents' work (with `--chrono`, their store units too), and

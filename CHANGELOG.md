@@ -1,5 +1,20 @@
 # Changelog
 
+- **v0.14.0** (14 November 2026) -- Schema lookup and schema identity are
+  stricter. Folders given with `--schemas-dir` are searched before those of
+  `schemas_dirs`, a user folder is searched by schema name and by file stem
+  before the bundled schemas, and looking up a name that two user folders hold
+  is an error naming both files; `mabillon schemas` reports such names.
+  `verify` refuses a schema found by the recorded name whose digest differs
+  from the recorded one, unless `--schema` is given. With `--chrono`, every run
+  records the hash of its schema text in its run record (`schema_sha256` in
+  `runs.spec`). Before it adopts pages that ChronoTranscriber finished, a run
+  looks up the schema each page was made with: one page of another known schema
+  refuses the document, and pages of unknown schema are adopted with a warning.
+  `_chronominer_metadata` gains `schema_sha256` and `schema_version`, as
+  ChronoMiner writes them. A ChronoMiner document that recorded no schema hash
+  and holds chunks of another tool is marked `schema_unverified` until `--force`
+  replaces every chunk.
 - **v0.13.0** (14 November 2026) -- The agent skill moves from
   `integrations/claude-code/mabillon/` to `skills/mabillon/` and is rewritten as the
   steps of a job: agree the scope, run a three-unit trial and project its time and

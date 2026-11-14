@@ -12,7 +12,7 @@ import { resolveContext } from "../src/context.ts";
 import { assignStems, discoverDocuments, type SourceDocument } from "../src/inputs/discover.ts";
 import { type Enhancement, gridLabels, prepareImage } from "../src/inputs/images.ts";
 import { boundaryScore, chunksFromLineRanges, chunkText, loadTextDocument } from "../src/inputs/text.ts";
-import { loadSchemaFile, resolveSchema } from "../src/schemas/registry.ts";
+import { listSchemas, loadSchemaFile, resolveSchema, SchemaAmbiguityError } from "../src/schemas/registry.ts";
 import { collectStatus } from "../src/status.ts";
 import { naturalCompare, parseSelection } from "../src/util.ts";
 import { buildGroundingSource, groundingCoverage, hasTailLoop } from "../src/verify/rules.ts";
@@ -577,6 +577,111 @@ describe("verify command schema choice", () => {
 			"--json",
 		]);
 		expect(JSON.parse(explicit.stdout).schema).toBe("diplomatic_markdown_transcription");
+	});
+
+	it("refuses a schema found by the recorded name whose digest differs, unless --schema is given", async () => {
+		const dir = tempDir();
+		const schemas = join(dir, "schemas");
+		const loaded = loadSchemaFile(writeTranscriptionSchema(schemas, "ledger_pages.json", "LedgerPages"));
+		const output = join(dir, "book.json");
+		const write = (sha256: string) =>
+			writeFileSync(
+				output,
+				JSON.stringify({
+					mabillon: { schema: { name: "LedgerPages", path: join(dir, "moved", "ledger_pages.json"), sha256 } },
+					pages: [{ page: 1, unit: "p0001", status: "committed", transcription: "Ledger page." }],
+				}),
+			);
+		write(loaded.sha256);
+		const same = await captureCli(["verify", output, "--schemas-dir", schemas, "--json"]);
+		expect(JSON.parse(same.stdout)).toMatchObject({ ok: true, schema: "LedgerPages" });
+		write("0".repeat(64));
+		const other = await captureCli(["verify", output, "--schemas-dir", schemas, "--json"]);
+		expect(other.code).toBe(2);
+		expect(JSON.parse(other.stdout).error).toMatch(/is not the one the output was made with .*pass --schema/);
+		const chosen = await captureCli([
+			"verify",
+			output,
+			"--schemas-dir",
+			schemas,
+			"--schema",
+			"LedgerPages",
+			"--json",
+		]);
+		expect(JSON.parse(chosen.stdout)).toMatchObject({ ok: true, schema: "LedgerPages" });
+	});
+});
+
+/** A transcription schema in the wrapper format, named `name`, as `dir/file`. */
+function writeTranscriptionSchema(dir: string, file: string, name: string): string {
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, file);
+	writeFileSync(
+		path,
+		JSON.stringify({
+			name,
+			strict: true,
+			schema: {
+				type: "object",
+				properties: { transcription: { type: "string" } },
+				required: ["transcription"],
+				additionalProperties: false,
+			},
+		}),
+	);
+	return path;
+}
+
+describe("schema folders", () => {
+	it("searches flag folders before settings folders, and a user schema shadows the bundled one", () => {
+		expect(mergeConfig({ schemasDirs: ["settings"] }, { schemasDirs: ["flag"] }).schemasDirs).toEqual([
+			"flag",
+			"settings",
+		]);
+		const dir = join(tempDir(), "project");
+		const own = writeTranscriptionSchema(dir, "own.json", "diplomatic_markdown_transcription");
+		expect(resolveSchema(undefined, "transcribe", [dir])).toMatchObject({ path: own, bundled: false });
+		const listed = listSchemas([dir]).filter((schema) => schema.name === "diplomatic_markdown_transcription");
+		expect(listed.map((schema) => schema.path)).toEqual([own]);
+	});
+
+	it("refuses to look up a schema name or file stem found in two user folders", async () => {
+		const root = tempDir();
+		const [a, b, c] = ["a", "b", "c"].map((name) => join(root, name));
+		const first = writeTranscriptionSchema(a, "ledger_pages.json", "LedgerPages");
+		const second = writeTranscriptionSchema(b, "other.json", "LedgerPages");
+		const failure = (work: () => unknown): Error => {
+			try {
+				work();
+			} catch (error) {
+				return error as Error;
+			}
+			throw new Error("no error");
+		};
+		const error = failure(() => resolveSchema("LedgerPages", "transcribe", [a, b]));
+		expect(error).toBeInstanceOf(SchemaAmbiguityError);
+		expect(error.message).toContain(first);
+		expect(error.message).toContain(second);
+		// Another name still resolves, and the path of either file does.
+		expect(resolveSchema("diplomatic_markdown_transcription", "transcribe", [a, b]).bundled).toBe(true);
+		expect(resolveSchema(second, "transcribe", [a, b]).path).toBe(second);
+		// The second file is still found by its own file stem.
+		expect(resolveSchema("other", "transcribe", [a, b]).path).toBe(second);
+		// A user file stem wins over a bundled schema of that name.
+		const d = join(root, "d");
+		const mine = writeTranscriptionSchema(d, "diplomatic_markdown_transcription.json", "MineOnly");
+		expect(resolveSchema("diplomatic_markdown_transcription", "transcribe", [d]).path).toBe(mine);
+		// A file stem in one folder and a schema name in the other.
+		writeTranscriptionSchema(c, "ledgerpages.json", "Unrelated");
+		expect(() => resolveSchema("ledgerpages", "transcribe", [a, c])).toThrow(
+			/"ledgerpages" is in two schema folders/i,
+		);
+		expect(resolveSchema("Unrelated", "transcribe", [a, c]).name).toBe("Unrelated");
+		// The same folder given twice is one folder.
+		expect(listSchemas([a, a]).filter((schema) => !schema.bundled)).toHaveLength(1);
+		const listed = await captureCli(["schemas", "--schemas-dir", a, "--schemas-dir", b, "--json"]);
+		expect(listed.code).toBe(0);
+		expect(JSON.parse(listed.stdout).ambiguous).toEqual([{ name: "LedgerPages", paths: [first, second] }]);
 	});
 });
 

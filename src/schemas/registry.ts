@@ -159,21 +159,77 @@ function declaredName(path: string): string | undefined {
 /** Schema files that could not be loaded during the last listSchemas() call. */
 export const schemaLoadErrors: SchemaLoadError[] = [];
 
-/** All schemas: user directories first (they shadow bundled schemas with the same name), then bundled. */
+/** The same schema name or file stem in two user schema folders; no caller may fall back to another schema. */
+export class SchemaAmbiguityError extends Error {
+	readonly paths: [string, string];
+
+	constructor(name: string, first: string, second: string) {
+		super(
+			`Schema "${name}" is in two schema folders: ${first} and ${second}; pass the file path, rename one of them, or leave one folder out of --schemas-dir and schemas_dirs`,
+		);
+		this.name = "SchemaAmbiguityError";
+		this.paths = [first, second];
+	}
+}
+
+/** A schema name or file stem that two user folders hold, with the first file of each. */
+export interface SchemaAmbiguity {
+	name: string;
+	paths: [string, string];
+}
+
+/** The names and file stems (lower case) that two user folders held during the last listSchemas() call. */
+export const schemaAmbiguities = new Map<string, SchemaAmbiguity>();
+
+/** User schemas the last listSchemas() call left out because an earlier one has their name; a file stem still finds them. */
+const unlistedUserSchemas: LoadedSchema[] = [];
+
+function folderKey(dir: string): string {
+	const absolute = resolve(dir);
+	return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+/**
+ * All schemas: user folders first, in the given order (they shadow bundled schemas with the same name), then the
+ * bundled ones. A name or file stem found in two user folders is recorded in schemaAmbiguities; resolveSchema refuses
+ * to look such a name up.
+ */
 export function listSchemas(extraDirs: string[]): LoadedSchema[] {
 	const result: LoadedSchema[] = [];
 	const names = new Set<string>();
 	schemaLoadErrors.length = 0;
-	const sources: Array<{ dir: string; bundled: boolean }> = [
-		...extraDirs.map((dir) => ({ dir, bundled: false })),
-		...bundledSchemaDirs().map((dir) => ({ dir, bundled: true })),
+	schemaAmbiguities.clear();
+	unlistedUserSchemas.length = 0;
+	const userDirs = [...new Map(extraDirs.map((dir) => [folderKey(dir), dir])).entries()];
+	const sources: Array<{ dir: string; key: string; bundled: boolean }> = [
+		...userDirs.map(([key, dir]) => ({ dir, key, bundled: false })),
+		...bundledSchemaDirs().map((dir) => ({ dir, key: folderKey(dir), bundled: true })),
 	];
-	for (const { dir, bundled } of sources) {
+	/** The first file of each name and stem in the user folders, with its folder. */
+	const owners = new Map<string, { folder: string; path: string }>();
+	const claim = (name: string | undefined, folder: string, path: string) => {
+		const keys = new Set([basename(path, extname(path)).toLowerCase(), ...(name ? [name.toLowerCase()] : [])]);
+		for (const key of keys) {
+			const owner = owners.get(key);
+			if (owner && owner.folder !== folder) {
+				if (!schemaAmbiguities.has(key)) {
+					schemaAmbiguities.set(key, {
+						name: name && name.toLowerCase() === key ? name : key,
+						paths: [owner.path, path],
+					});
+				}
+			} else if (!owner) {
+				owners.set(key, { folder, path });
+			}
+		}
+	};
+	for (const { dir, key: folder, bundled } of sources) {
 		for (const path of schemaFilesIn(dir)) {
 			let loaded: LoadedSchema;
 			try {
 				loaded = loadSchemaFile(path, bundled);
 			} catch (error) {
+				if (!bundled) claim(declaredName(path), folder, path);
 				schemaLoadErrors.push({
 					path,
 					error: error instanceof Error ? error.message : String(error),
@@ -182,13 +238,21 @@ export function listSchemas(extraDirs: string[]): LoadedSchema[] {
 				});
 				continue;
 			}
+			if (!bundled) claim(loaded.name, folder, path);
 			const key = loaded.name.toLowerCase();
-			if (names.has(key)) continue;
+			if (names.has(key)) {
+				if (!bundled) unlistedUserSchemas.push(loaded);
+				continue;
+			}
 			names.add(key);
 			result.push(loaded);
 		}
 	}
 	return result;
+}
+
+function fileStem(path: string): string {
+	return basename(path, extname(path)).toLowerCase();
 }
 
 /** Resolve --schema (a path, a schema name, or a file stem); transcription defaults to the bundled schema. */
@@ -204,15 +268,20 @@ export function resolveSchema(spec: string | undefined, mode: Mode, extraDirs: s
 	} else {
 		const lower = wanted.toLowerCase();
 		const all = listSchemas(extraDirs);
+		const ambiguous = schemaAmbiguities.get(lower);
+		if (ambiguous) throw new SchemaAmbiguityError(ambiguous.name, ...ambiguous.paths);
 		// A user schema of that name (or file stem) that fails to load must not be replaced silently by a bundled one.
 		const broken = schemaLoadErrors.find(
-			(problem) =>
-				!problem.bundled &&
-				(problem.name?.toLowerCase() === lower || basename(problem.path, ".json").toLowerCase() === lower),
+			(problem) => !problem.bundled && (problem.name?.toLowerCase() === lower || fileStem(problem.path) === lower),
 		);
+		// A user folder is searched by name and by file stem before the bundled schemas.
+		const user = [...all.filter((schema) => !schema.bundled), ...unlistedUserSchemas];
+		const bundled = all.filter((schema) => schema.bundled);
 		loaded =
-			all.find((schema) => schema.name.toLowerCase() === lower) ??
-			all.find((schema) => basename(schema.path, ".json").toLowerCase() === lower);
+			user.find((schema) => schema.name.toLowerCase() === lower) ??
+			user.find((schema) => fileStem(schema.path) === lower) ??
+			bundled.find((schema) => schema.name.toLowerCase() === lower) ??
+			bundled.find((schema) => fileStem(schema.path) === lower);
 		if (broken && (!loaded || loaded.bundled)) {
 			throw new Error(`Schema "${wanted}" could not be loaded: ${broken.error}`);
 		}

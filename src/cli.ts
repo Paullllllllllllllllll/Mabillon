@@ -19,6 +19,7 @@ import {
 	listSchemas,
 	loadSchemaFile,
 	resolveSchema,
+	schemaAmbiguities,
 	schemaLoadErrors,
 } from "./schemas/registry.ts";
 import { collectStatus } from "./status.ts";
@@ -54,7 +55,8 @@ Work organization:
 
 Inputs and context:
   --schema <name|path>         schema (transcription default: diplomatic_markdown_transcription)
-  --schemas-dir <dir>          additional schema directory (repeatable)
+  --schemas-dir <dir>          schema folder, searched before those of schemas_dirs and the bundled schemas
+                               (repeatable; a name that two of these folders hold cannot be looked up)
   --context <file>             context text for every document (repeatable)
   --context-image <file>       context image for every document (repeatable)
   --no-auto-context            do not pick up context.md / <stem>.context.md / context*.png next to inputs
@@ -406,12 +408,21 @@ function loadVerifySchema(
 		if (recorded.path && existsSync(recorded.path)) {
 			try {
 				const file = loadSchemaFile(recorded.path);
-				if (!recorded.sha256 || file.sha256 === recorded.sha256) return file;
+				if (!recorded.sha256 || file.sha256 === recorded.sha256 || file.legacySha256 === recorded.sha256) {
+					return file;
+				}
 			} catch {
 				// fall back to the name
 			}
 		}
-		return resolveSchema(recorded.name, mode, config.schemasDirs);
+		const found = resolveSchema(recorded.name, mode, config.schemasDirs);
+		// The name may now find another file, or the same file changed: only the recorded digest says it is the schema.
+		if (recorded.sha256 && found.sha256 !== recorded.sha256 && found.legacySha256 !== recorded.sha256) {
+			throw new Error(
+				`The schema "${recorded.name}" found at ${found.path} is not the one the output was made with (recorded ${recorded.sha256.slice(0, 12)}..., found ${found.sha256.slice(0, 12)}...); pass --schema to check against a schema anyway`,
+			);
+		}
+		return found;
 	}
 	return resolveSchema(undefined, mode, config.schemasDirs);
 }
@@ -522,6 +533,7 @@ function schemasCommand(parsed: ParsedArgs): number {
 					verbatim_fields: schema.rules.verbatimFields ?? [],
 				})),
 				load_errors: schemaLoadErrors.map((problem) => ({ path: problem.path, error: problem.error })),
+				ambiguous: [...schemaAmbiguities.values()].map((item) => ({ name: item.name, paths: item.paths })),
 			});
 			return 0;
 		}
@@ -534,6 +546,9 @@ function schemasCommand(parsed: ParsedArgs): number {
 			);
 		}
 		for (const problem of schemaLoadErrors) process.stdout.write(`could not load: ${problem.error}\n`);
+		for (const item of schemaAmbiguities.values()) {
+			process.stdout.write(`in two schema folders: ${item.name} (${item.paths.join(" and ")})\n`);
+		}
 		return 0;
 	} catch (error) {
 		return fail(parsed, errorMessage(error));

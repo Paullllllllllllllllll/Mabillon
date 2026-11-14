@@ -261,6 +261,8 @@ def check_plan(
         args += ["--output", scenario["output"]]
     if TOOL == "chronotranscriber":
         args += ["--formats", ",".join(scenario["formats"])]
+        if scenario.get("schema"):
+            args += ["--schema", scenario["schema"]]
         if source.is_dir():
             args += ["--type", "images"]
     else:
@@ -308,9 +310,10 @@ def check_drop(root: Path, scenario: dict[str, Any]) -> None:
 
 
 def check_repair(root: Path, scenario: dict[str, Any]) -> None:
-    result = run_tool(
-        "repair", "--input", str(root / DATABASE_NAME), "--dry-run", "--json"
-    )
+    args = ["repair", "--input", str(root / DATABASE_NAME), "--dry-run", "--json"]
+    if TOOL == "chronotranscriber" and scenario.get("schema"):
+        args += ["--schema", scenario["schema"]]
+    result = run_tool(*args)
     check(
         result.returncode == 0,
         f"repair --dry-run exit {result.returncode}: {result.stderr[-400:]}",

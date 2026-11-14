@@ -469,6 +469,36 @@ function schemaText(schema: LoadedSchema): string {
 	return readFileSync(schema.path, "utf8").replace(/\r\n?/g, "\n");
 }
 
+/** The SHA-256 under which a run stores the schema text in `artifacts` (and records it in `runs.spec`). */
+export function schemaTextSha256(schema: LoadedSchema): string {
+	return textSha256(schemaText(schema));
+}
+
+/**
+ * The schema hash a done page was made with: the `schema_sha256` entry in the `runs.spec` of the run that sent its
+ * request (a batch page: the run of its submission). Undefined when unknown: a run that recorded none, or a page
+ * the decision pre-pass closed without a request.
+ */
+function pageSchemaSha(c: Connection, docId: number, kind: string, idx: number): string | undefined {
+	const page = c.get(
+		"SELECT u.outcome, u.run_id AS unit_run, r.submission_id, s.run_id AS batch_run FROM units AS u LEFT JOIN responses AS r ON r.response_id = u.response_id LEFT JOIN submissions AS s ON s.submission_id = r.submission_id WHERE u.doc_id = ? AND u.kind = ? AND u.idx = ?",
+		docId,
+		kind,
+		idx,
+	);
+	if (!page || page.outcome === "skipped_no_text") return undefined;
+	const runId = page.submission_id !== null && page.submission_id !== undefined ? page.batch_run : page.unit_run;
+	if (runId === null || runId === undefined) return undefined;
+	const spec = c.get("SELECT spec FROM runs WHERE run_id = ?", String(runId))?.spec;
+	if (typeof spec !== "string") return undefined;
+	try {
+		const entry = (JSON.parse(spec) as { schema_sha256?: { value?: unknown } } | null)?.schema_sha256;
+		return typeof entry?.value === "string" ? entry.value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export class ChronoSync {
 	readonly plan: ChronoPlan;
 	private readonly registry: StoreRegistry;
@@ -525,10 +555,61 @@ export class ChronoSync {
 	/** Leases taken by the preflight on documents already in the store, by document name. */
 	private preleased = new Map<string, Lease>();
 
+	/** Pages of a ChronoTranscriber document whose schema is unknown and that the start adopts, by document name. */
+	private unknownSchemaPages = new Map<string, Set<number>>();
+
 	/** The SHA-256 of the schema text as ChronoMiner records it in document_meta. */
 	private currentSchemaSha(): string {
-		this.schemaSha ??= textSha256(schemaText(this.options.schema));
+		this.schemaSha ??= schemaTextSha256(this.options.schema);
 		return this.schemaSha;
+	}
+
+	/**
+	 * Refuse a ChronoTranscriber document whose pages this start would adopt when one of them was transcribed with
+	 * another schema; pages of unknown schema are noted for a warning. Under the lease, before any unit changes.
+	 */
+	private checkAdoptedSchemas(
+		c: Connection,
+		document: StoreDocPlan,
+		docId: number,
+		units: MappedUnit[],
+		path: string,
+	): void {
+		const rows = new Map(
+			(
+				c.all("SELECT * FROM units WHERE doc_id = ? AND kind = ?", docId, document.unitKind) as unknown as UnitRow[]
+			).map((row) => [row.idx, row]),
+		);
+		const unknown = new Set<number>();
+		const other: Array<{ page: number; sha: string }> = [];
+		for (const { unit, planned } of units) {
+			const row = rows.get(planned.idx);
+			if (!row || adoptAction(unit, row) !== "adopt") continue;
+			const sha = pageSchemaSha(c, docId, document.unitKind, planned.idx);
+			if (sha === undefined) unknown.add(planned.idx);
+			else if (sha !== this.currentSchemaSha()) other.push({ page: planned.idx + 1, sha });
+		}
+		if (other.length > 0) {
+			const stored = [...new Set(other.map((item) => `${item.sha.slice(0, 12)}...`))].join(", ");
+			throw new Error(
+				`the store document '${document.name}' in ${path} has ${other.length} page(s) transcribed with another schema (page ${other.map((item) => item.page).join(", ")}; stored ${stored}, now ${this.currentSchemaSha().slice(0, 12)}...); use --force to transcribe it again, or write to another --out`,
+			);
+		}
+		this.unknownSchemaPages.set(document.name, unknown);
+	}
+
+	/**
+	 * Whether a ChronoMiner document that recorded no schema hash keeps done chunks another tool extracted: their
+	 * schema is unknown, so the document is marked `schema_unverified` when its hash is recorded.
+	 */
+	private keepsUnknownChunks(c: Connection, docId: number): boolean {
+		const stored = c.get("SELECT schema_sha256 FROM document_meta WHERE doc_id = ?", docId)?.schema_sha256;
+		if (stored !== null && stored !== undefined) return false;
+		const foreign = c.get(
+			"SELECT count(*) AS n FROM units WHERE doc_id = ? AND kind = 'chunk' AND status = 'done' AND tool <> 'mabillon'",
+			docId,
+		);
+		return Number(foreign?.n ?? 0) > 0;
 	}
 
 	/**
@@ -733,6 +814,7 @@ export class ChronoSync {
 				`the store document '${document.name}' ${problem}; use --force to replace its units, or write to another --out`,
 			);
 		}
+		if (this.plan.tool === "chronotranscriber") this.checkAdoptedSchemas(c, document, docId, units, store.path);
 		recordIdentity(c, docId, identity);
 		planUnits(c, docId, kind, planned, stamp);
 	}
@@ -760,6 +842,9 @@ export class ChronoSync {
 						renderer: "mabillon",
 					},
 		};
+		// As ChronoMiner does: --force replaces every chunk and removes the mark; a later resume keeps it.
+		if (this.options.force) values.schema_unverified = null;
+		else if (this.keepsUnknownChunks(c, held.docId)) values.schema_unverified = true;
 		writeMetadata(c, held.docId, values, this.schemaSha, (this.store as ChronoStore).run(), isoTime());
 	}
 
@@ -768,43 +853,24 @@ export class ChronoSync {
 		const store = this.store as ChronoStore;
 		const rows = new Map(store.units(held.docId, held.plan.unitKind).map((row) => [row.idx, row]));
 		let adopted = 0;
+		const unknown: number[] = [];
 		for (const { unit, planned } of held.units) {
 			const row = rows.get(planned.idx);
 			if (!row) continue;
 			held.signatures.set(planned.idx, unitSignature(row));
-			// The store row is the current state. A finished unit whose row has changed since Mabillon last saw or wrote
-			// it (run_id, status or the stale flag; a reset or forced replacement keeps the tool column) is worked again,
-			// or adopted when another tool finished it; so is an adopted unit whose row is no longer done. The row as it
-			// is now becomes the baseline of the next start, saved before any agent work.
-			const usable = row.status === "done" && row.stale !== 1 && row.content !== null && row.tool !== "mabillon";
-			const seen = unit.storeRow;
-			const now = baseline(row);
-			const changed =
-				seen !== undefined && (seen.runId !== now.runId || seen.status !== now.status || seen.stale !== now.stale);
-			unit.storeRow = now;
-			// Correction mode: a drafted unit whose row changed since Mabillon last saw it (also one --redo-review set
-			// to pending) is corrected again from its saved draft, never adopted.
-			if (unit.draft && changed) {
+			const action = adoptAction(unit, row);
+			// The row as it is now becomes the baseline of the next start, saved before any agent work.
+			unit.storeRow = baseline(row);
+			if (action === "redraft") {
 				if (unit.status !== "pending") reopenUnit(unit);
 				restoreDraft(paths, state, unit);
 				continue;
 			}
-			// A drafted unit is worked by the agent, also when its draft is this store's done row, and so is one whose
-			// draft could not be read or matched.
-			if ((unit.draft || unit.draftRejected) && unit.status === "pending") continue;
-			if (seen !== undefined && !unit.adopted && unit.status !== "pending") {
-				if (seen.runId === now.runId && seen.status === now.status && seen.stale === now.stale) continue;
-				// A corrected unit is never replaced by another tool's row: it is corrected again from its draft.
-				if (!usable || unit.draft) {
-					reopenUnit(unit);
-					if (unit.draft) restoreDraft(paths, state, unit);
-					continue;
-				}
-			} else if (unit.adopted && !usable) {
+			if (action === "reopen") {
 				reopenUnit(unit);
 				continue;
 			}
-			if (!usable || row.content === null) continue;
+			if (action === "keep" || row.content === null) continue;
 			const content =
 				this.options.mode === "transcribe"
 					? adoptedTranscription(row.content, this.options.schema)
@@ -819,10 +885,16 @@ export class ChronoSync {
 			unit.committedAt = new Date().toISOString();
 			unit.adopted = { tool: row.tool, runId: row.run_id, model: row.model, outcome: row.outcome ?? undefined };
 			adopted++;
+			if (this.unknownSchemaPages.get(held.plan.name)?.has(planned.idx)) unknown.push(planned.idx + 1);
 		}
 		if (adopted > 0) {
 			this.options.log(
 				`${state.stem}: ${adopted} unit(s) of '${held.plan.name}' were done by another tool and are adopted`,
+			);
+		}
+		if (unknown.length > 0) {
+			this.options.warn(
+				`${unknown.length} adopted page(s) of '${held.plan.name}' (page ${unknown.join(", ")}) come from runs that recorded no schema hash, so their schema is not known`,
 			);
 		}
 	}
@@ -1035,6 +1107,33 @@ export class ChronoSync {
 
 function baseline(row: UnitRow): { status: string; stale: number; runId: string } {
 	return { status: row.status, stale: Number(row.stale), runId: row.run_id };
+}
+
+/**
+ * What a start does with a unit given its store row as it is now; changes nothing. The store row is the current
+ * state. A finished unit whose row has changed since Mabillon last saw or wrote it (run_id, status or the stale flag;
+ * a reset or forced replacement keeps the tool column) is worked again, or adopted when another tool finished it; so
+ * is an adopted unit whose row is no longer done. "redraft": corrected again from its saved draft.
+ */
+function adoptAction(unit: UnitRecord, row: UnitRow): "adopt" | "keep" | "reopen" | "redraft" {
+	const usable = row.status === "done" && row.stale !== 1 && row.content !== null && row.tool !== "mabillon";
+	const seen = unit.storeRow;
+	const now = baseline(row);
+	const changed =
+		seen !== undefined && (seen.runId !== now.runId || seen.status !== now.status || seen.stale !== now.stale);
+	// Correction mode: a drafted unit whose row changed since Mabillon last saw it (also one --redo-review set to
+	// pending) is corrected again from its saved draft, never adopted.
+	if (unit.draft && changed) return "redraft";
+	// A drafted unit is worked by the agent, also when its draft is this store's done row, and so is one whose draft
+	// could not be read or matched.
+	if ((unit.draft || unit.draftRejected) && unit.status === "pending") return "keep";
+	if (seen !== undefined && !unit.adopted && unit.status !== "pending") {
+		if (!changed) return "keep";
+		if (!usable) return "reopen";
+	} else if (unit.adopted && !usable) {
+		return "reopen";
+	}
+	return usable ? "adopt" : "keep";
 }
 
 /** The first of `outputs` that the store registers for any of its documents, with that document's name. */

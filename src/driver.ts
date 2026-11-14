@@ -49,6 +49,7 @@ import {
 	planDocument,
 	renderWithoutStore,
 	type StoreRegistry,
+	schemaTextSha256,
 	staleError,
 } from "./chrono/document.ts";
 import { type DraftsStore, findDrafts, rangesText, resolveDrafts, seedDrafts } from "./chrono/drafts.ts";
@@ -1657,17 +1658,23 @@ function checkCollisions(documents: SourceDocument[], plans: ChronoPlan[]): void
 	});
 }
 
-/** The run's settings as the store's `runs.spec` records them: `{key: {value, source}}`. */
-function runSpec(config: ChronoConfig): Record<string, { value: unknown; source: string }> {
+/**
+ * The run's settings as the store's `runs.spec` records them: `{key: {value, source}}`, with `schema_sha256`, the
+ * hash under which the run stores its schema text in `artifacts`.
+ */
+function runSpec(config: ChronoConfig, schema: LoadedSchema): Record<string, { value: unknown; source: string }> {
 	const defaults = DEFAULT_CONFIG as unknown as Record<string, unknown>;
-	return Object.fromEntries(
-		Object.entries(config as unknown as Record<string, unknown>)
-			.filter(([, value]) => value !== undefined)
-			.map(([key, value]) => [
-				key,
-				{ value, source: JSON.stringify(value) === JSON.stringify(defaults[key]) ? "default" : "settings" },
-			]),
-	);
+	return {
+		...Object.fromEntries(
+			Object.entries(config as unknown as Record<string, unknown>)
+				.filter(([, value]) => value !== undefined)
+				.map(([key, value]) => [
+					key,
+					{ value, source: JSON.stringify(value) === JSON.stringify(defaults[key]) ? "default" : "settings" },
+				]),
+		),
+		schema_sha256: { value: schemaTextSha256(schema), source: "computed" },
+	};
 }
 
 export async function run(options: RunOptions): Promise<RunSummary> {
@@ -1756,7 +1763,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 		};
 	}
 	const notices = new Set<string>();
-	const registry = createRegistry({ command: mode, toolVersion: readPackageVersion(), spec: runSpec(config) });
+	const registry = createRegistry({ command: mode, toolVersion: readPackageVersion(), spec: runSpec(config, schema) });
 
 	const results: DocumentResult[] = new Array(documents.length);
 	let next = 0;

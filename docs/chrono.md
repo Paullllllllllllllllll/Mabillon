@@ -79,6 +79,8 @@ Without `--force`, a run also refuses:
 
 - a store document of another input,
 - a ChronoMiner document with chunks extracted with another schema,
+- a ChronoTranscriber document with a page the run would adopt that was transcribed
+  with another schema,
 - a document whose units were laid out differently, that is, with other pages or line
   ranges.
 
@@ -91,6 +93,35 @@ another tool has reset, failed or marked stale since Mabillon exported it (anoth
 A rendered file that cannot be replaced fails the document. `--force` never deletes a
 working folder that holds the run of another input or of the other command
 (`transcribe` or `extract`).
+
+### Schema identity
+
+Every `--chrono` run records the hash of its schema text as the `schema_sha256` entry
+of its `runs.spec`, the hash under which it stores that text in `artifacts`.
+
+The schema of a ChronoTranscriber page is the one recorded by the run that sent its
+request; for a batch page, that is the run of its submission. Under the document's
+lease, before it writes anything, a run looks up every page it would adopt. One page
+with another known hash refuses the document; `--force` transcribes it again, and
+another `--out` leaves the store alone. A page whose schema is unknown is adopted with
+a warning in the result. Such pages come from runs that recorded no hash, or were
+closed by the decision pre-pass without a request (outcome `skipped_no_text`). In
+correction mode the drafted pages are rewritten by the agent and not checked; done
+pages without a draft are adopted and checked like any other.
+
+A run that shares a store with ChronoTranscriber therefore needs ChronoTranscriber's
+own schema file for that run: pass `--schemas-dir` with ChronoTranscriber's schema
+folder. The bundled transcription schemas are copies of an older ChronoTranscriber
+version and hash differently once that tool's files change.
+
+A ChronoMiner document records one schema hash in `document_meta`. When a document
+that recorded none holds chunks another tool extracted, the run records its hash and
+marks the document `schema_unverified: true` in its run metadata, as ChronoMiner
+does, since the schema of those chunks is unknown; `--force`, which replaces every
+chunk, removes the mark. `_chronominer_metadata` in `<stem>_output.json` carries
+`schema_sha256`, and `schema_version` when the stored schema text has a top-level
+one, after `schema_name`. A document without a recorded hash, one whose schema text
+is missing from `artifacts`, and one marked `schema_unverified` get neither key.
 
 ## Correction mode
 

@@ -5,6 +5,7 @@ import { basename, dirname, join } from "node:path";
 import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
 import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
+import { schemaTextSha256 } from "../src/chrono/document.ts";
 import { inputIdentity } from "../src/chrono/identity.ts";
 import { realPath } from "../src/chrono/paths.ts";
 import { renderCsv, renderOutputJson } from "../src/chrono/render-cm.ts";
@@ -13,6 +14,7 @@ import { Connection, readOnly } from "../src/chrono/sqlite.ts";
 import { ChronoStore, LEASE_TTL, refreshDocument } from "../src/chrono/store.ts";
 import { type ChronoConfig, mergeConfig } from "../src/config.ts";
 import { run } from "../src/driver.ts";
+import { resolveSchema } from "../src/schemas/registry.ts";
 import {
 	call,
 	createFauxRuntime,
@@ -257,6 +259,11 @@ describe("ChronoTranscriber outputs", () => {
 			"prompt",
 			"schema",
 		]);
+		// The run record names the schema text it stored, so that a later page check can find it.
+		expect(JSON.parse(String(query(database, "SELECT spec FROM runs")[0].spec)).schema_sha256).toEqual({
+			value: query(database, "SELECT sha256 FROM artifacts WHERE kind = 'schema'")[0].sha256,
+			source: "computed",
+		});
 		expect(query(database, "SELECT count(*) AS n FROM page_text")[0].n).toBe(3);
 		// The draft of the page closed for review stays in the sidecar; the working folder sits in .mabillon.
 		const sidecar = readSidecar(out, "receipts");
@@ -269,6 +276,8 @@ describe("ChronoTranscriber outputs", () => {
 			input: pdf,
 			output: realPath(out),
 			formats: ["txt", "md"],
+			// ChronoTranscriber continues a document only with the schema its done pages were made with.
+			schema: sidecar.mabillon.schema.path,
 			expect: { [name]: "partial" },
 			// ChronoTranscriber retries failed pages by default; without that the document is complete.
 			plans: [
@@ -308,6 +317,7 @@ describe("ChronoTranscriber outputs", () => {
 			input: realPath(folder),
 			output: null,
 			formats: ["txt"],
+			schema: readSidecar(root, "scans").mabillon.schema.path,
 			expect: { scans: "partial" },
 		});
 	}, 120_000);
@@ -1110,10 +1120,20 @@ function writeCtDocument(
 		label: string | null;
 		sourceIndex?: number | string;
 		stale?: number;
+		outcome?: string;
 	}>,
-	options: { docId?: number; kind?: string; sha256?: string | null; unitKind?: string } = {},
+	options: StoreDocumentOptions = {},
 ) {
 	writeStoreDocument("chronotranscriber", root, name, input, units, options);
+}
+
+interface StoreDocumentOptions {
+	docId?: number;
+	kind?: string;
+	sha256?: string | null;
+	unitKind?: string;
+	/** The `runs.spec` of the tool's run (default none). */
+	spec?: Record<string, unknown>;
 }
 
 /** A store document as ChronoTranscriber or ChronoMiner writes it (units of kind page or chunk, run ct-run/cm-run). */
@@ -1128,8 +1148,9 @@ function writeStoreDocument(
 		label: string | null;
 		sourceIndex?: number | string;
 		stale?: number;
+		outcome?: string;
 	}>,
-	options: { docId?: number; kind?: string; sha256?: string | null; unitKind?: string } = {},
+	options: StoreDocumentOptions = {},
 ) {
 	const store = ChronoStore.open(root, tool, { command: "x", toolVersion: "0", spec: {} });
 	store.close(undefined);
@@ -1145,10 +1166,11 @@ function writeStoreDocument(
 	try {
 		connection.transaction((c) => {
 			c.run(
-				"INSERT OR IGNORE INTO runs (run_id, tool, tool_version, command, started_at) VALUES (?, ?, '1.3.1', ?, '2026-11-01T00:00:00.000+00:00')",
+				"INSERT OR IGNORE INTO runs (run_id, tool, tool_version, command, started_at, spec) VALUES (?, ?, '1.3.1', ?, '2026-11-01T00:00:00.000+00:00', ?)",
 				run,
 				tool,
 				tool === "chronotranscriber" ? "transcribe" : "extract",
+				options.spec ? JSON.stringify(options.spec) : null,
 			);
 			c.run(
 				"INSERT INTO documents (doc_id, name, tool, input_path, input_sha256, kind, first_run_id, last_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1168,7 +1190,7 @@ function writeStoreDocument(
 					options.unitKind ?? (tool === "chronotranscriber" ? "page" : "chunk"),
 					idx,
 					unit.status,
-					unit.status === "done" ? "ok" : unit.status === "failed" ? "failed" : null,
+					unit.outcome ?? (unit.status === "done" ? "ok" : unit.status === "failed" ? "failed" : null),
 					unit.sourceIndex ?? unit.label,
 					unit.label,
 					unit.content,
@@ -1395,5 +1417,219 @@ describe("without --chrono", () => {
 		await expect(standalone.run("transcribe", [pdf])).rejects.toThrow(
 			/holds a chronotranscriber\.sqlite; use --chrono to write into its store/,
 		);
+	}, 120_000);
+});
+
+describe("schema identity in the store", () => {
+	const OTHER = { schema_sha256: { value: "f".repeat(64), source: "computed" } };
+	const own = () => ({
+		schema_sha256: { value: schemaTextSha256(resolveSchema(undefined, "transcribe", [])), source: "computed" },
+	});
+	const label = (n: number) => `scan_${n}.png_pre_processed.jpg`;
+	const recorder = (worked: string[]) => {
+		const inner = transcriber();
+		return (context: TranscriptContext) => {
+			const unit = currentUnit(context);
+			if (unit && !worked.includes(unit)) worked.push(unit);
+			return inner(context);
+		};
+	};
+
+	it("renders schema_version and schema_sha256 from the store, and neither without a recorded hash or schema text", async () => {
+		const root = tempDir();
+		const text = join(root, "prices.md");
+		writeFileSync(text, `${RECIPES_TEXT}\n`);
+		const schema = join(root, "schemas", "versioned_prices.json");
+		mkdirSync(dirname(schema), { recursive: true });
+		writeFileSync(schema, `${JSON.stringify({ ...PRICE_SCHEMA, schema_version: "2.1.0" }, null, 2)}\n`);
+		const summary = await (await harness(extractor(), { schema, chunkTokens: 100 })).run("extract", [text]);
+		expect(summary.documents[0].error).toBeUndefined();
+		const database = join(realPath(root), "chronominer.sqlite");
+		const sha = String(query(database, "SELECT sha256 FROM artifacts WHERE kind = 'schema'")[0].sha256);
+		const meta = JSON.parse(readFileSync(join(root, "prices_output.json"), "utf8"))._chronominer_metadata;
+		expect(Object.keys(meta).slice(0, 5)).toEqual([
+			"schema_name",
+			"schema_version",
+			"schema_sha256",
+			"model_name",
+			"chunking_method",
+		]);
+		expect(meta).toMatchObject({ schema_version: "2.1.0", schema_sha256: sha });
+		// The run record names the stored schema text.
+		const spec = JSON.parse(String(query(database, "SELECT spec FROM runs WHERE tool = 'mabillon'")[0].spec));
+		expect(spec.schema_sha256).toEqual({ value: sha, source: "computed" });
+		const rendered = (update: string) => {
+			const connection = new Connection(database);
+			try {
+				connection.run(update);
+				return JSON.parse(renderOutputJson(connection, 1))._chronominer_metadata;
+			} finally {
+				connection.close();
+			}
+		};
+		for (const update of [
+			"UPDATE document_meta SET schema_sha256 = NULL",
+			`UPDATE document_meta SET schema_sha256 = '${"0".repeat(64)}'`,
+		]) {
+			const keys = Object.keys(rendered(update));
+			expect(keys).not.toContain("schema_version");
+			expect(keys).not.toContain("schema_sha256");
+		}
+	}, 120_000);
+
+	it("marks a ChronoMiner document unverified while it keeps chunks of unknown schema", async () => {
+		const root = tempDir();
+		const text = join(root, "prices.md");
+		writeFileSync(text, `${RECIPES_TEXT}\n`);
+		const schema = writePriceSchema(root);
+		const first = await (await harness(extractor(), { schema, chunkTokens: 100 })).run("extract", [text]);
+		expect(first.documents[0].error).toBeUndefined();
+		const units = first.documents[0].units;
+		const database = join(realPath(root), "chronominer.sqlite");
+		// The chunks as ChronoMiner writes them into a document without a recorded hash; chunk 1 is still to do.
+		const connection = new Connection(database);
+		connection.run("INSERT INTO runs (run_id, tool, started_at) VALUES ('cm-run', 'chronominer', 'x')");
+		connection.run("UPDATE units SET tool = 'chronominer', run_id = 'cm-run'");
+		connection.run("UPDATE units SET status = 'pending', outcome = NULL, content = NULL WHERE idx = 0");
+		connection.run("UPDATE document_meta SET schema_sha256 = NULL");
+		refreshDocument(connection, 1, "cm-run");
+		connection.close();
+		rmSync(join(realPath(root), ".mabillon"), { recursive: true, force: true });
+		const recorded = () => query(database, "SELECT schema_sha256 FROM document_meta")[0].schema_sha256;
+		const output = () => JSON.parse(readFileSync(join(root, "prices_output.json"), "utf8"))._chronominer_metadata;
+		const adopted = await (await harness(extractor(), { schema, chunkTokens: 100 })).run("extract", [text]);
+		expect(adopted.documents[0]).toMatchObject({ committed: units, pending: 0 });
+		expect(adopted.documents[0].error).toBeUndefined();
+		expect(readSidecar(root, "prices").mabillon.units_adopted).toBe(units - 1);
+		const sha = query(database, "SELECT sha256 FROM artifacts WHERE kind = 'schema'")[0].sha256;
+		expect(recorded()).toBe(sha);
+		expect(output().schema_sha256).toBeUndefined();
+		expect(output().schema_unverified).toBe(true);
+		// Mabillon's own resume keeps the mark.
+		const resumed = await (await harness(extractor(), { schema, chunkTokens: 100 })).run("extract", [text]);
+		expect(resumed.documents[0].error).toBeUndefined();
+		expect(output().schema_unverified).toBe(true);
+		// Once every chunk is replaced, the mark goes and the hash is published.
+		const forced = await (await harness(extractor(), { schema, chunkTokens: 100, force: true })).run("extract", [
+			text,
+		]);
+		expect(forced.documents[0].error).toBeUndefined();
+		expect(recorded()).toBe(sha);
+		expect(output().schema_sha256).toBe(sha);
+		expect(output().schema_unverified).toBeUndefined();
+	}, 120_000);
+
+	it("refuses to adopt pages ChronoTranscriber transcribed with another schema, and adopts unknown ones with a warning", async () => {
+		const root = tempDir();
+		const folder = await makeImageFolder(join(root, "scans"), 3);
+		writeCtDocument(
+			realPath(root),
+			"scans",
+			realPath(folder),
+			[
+				{ status: "done", content: "Page one by ChronoTranscriber.", label: label(1) },
+				// Closed by the decision pre-pass without a request: its schema is unknown.
+				{ status: "done", content: "[No transcribable text]", label: label(2), outcome: "skipped_no_text" },
+				{ status: "pending", content: null, label: label(3) },
+			],
+			{ spec: OTHER },
+		);
+		const database = join(realPath(root), "chronotranscriber.sqlite");
+		const refused = await (await harness(transcriber(), {})).run("transcribe", [folder]);
+		expect(refused.documents[0].error).toMatch(
+			/'scans' in .* has 1 page\(s\) transcribed with another schema \(page 1; stored ffffffffffff\.\.\., now [0-9a-f]{12}\.\.\.\); use --force/,
+		);
+		expect(query(database, "SELECT tool, status FROM units ORDER BY idx")).toEqual([
+			{ tool: "chronotranscriber", status: "done" },
+			{ tool: "chronotranscriber", status: "done" },
+			{ tool: "chronotranscriber", status: "pending" },
+		]);
+		expect(existsSync(join(realPath(root), ".mabillon", "scans", "run", "state.json"))).toBe(false);
+		// The same schema: page 1 is adopted, page 2 too, with a warning.
+		const connection = new Connection(database);
+		connection.run("UPDATE runs SET spec = ? WHERE run_id = 'ct-run'", JSON.stringify(own()));
+		connection.close();
+		const worked: string[] = [];
+		const adopted = await (await harness(recorder(worked), {})).run("transcribe", [folder]);
+		expect(adopted.documents[0]).toMatchObject({ committed: 3, pending: 0 });
+		expect(worked).toEqual(["p0003"]);
+		expect(adopted.documents[0].warnings).toEqual(
+			expect.arrayContaining([expect.stringMatching(/1 adopted page\(s\) of 'scans' \(page 2\) .*no schema hash/)]),
+		);
+	}, 120_000);
+
+	it("finds the schema of a batch page through its submission's run", async () => {
+		const pages = [
+			{ status: "done", content: "Page one, sent alone.", label: label(1) },
+			{ status: "done", content: "Page two, sent in a batch.", label: label(2) },
+		];
+		// ct-run sent page 1 and finalized the batch of page 2, which ct-submit submitted.
+		const setUp = async (finalizing: Record<string, unknown>, submitting: Record<string, unknown>) => {
+			const root = realPath(tempDir());
+			const folder = await makeImageFolder(join(root, "scans"), 2);
+			writeCtDocument(root, "scans", realPath(folder), pages, { spec: finalizing });
+			const connection = new Connection(join(root, "chronotranscriber.sqlite"));
+			connection.transaction((c) => {
+				c.run(
+					"INSERT INTO runs (run_id, tool, started_at, spec) VALUES ('ct-submit', 'chronotranscriber', 'x', ?)",
+					JSON.stringify(submitting),
+				);
+				c.run(
+					"INSERT INTO submissions (submission_id, tool, provider, model, run_id, intent_at, batch_id, status, request_count) VALUES ('sub-1', 'chronotranscriber', 'openai', 'gpt-6-luna', 'ct-submit', 'x', 'batch-1', 'finalized', 1)",
+				);
+				for (const [idx, submission] of [
+					[0, null],
+					[1, "sub-1"],
+				] as const) {
+					c.run(
+						"INSERT INTO responses (doc_id, kind, idx, run_id, tool, provider, model, submission_id, created_at) VALUES (1, 'page', ?, 'ct-run', 'chronotranscriber', 'openai', 'gpt-6-luna', ?, 'x')",
+						idx,
+						submission,
+					);
+					c.run(
+						"UPDATE units SET response_id = (SELECT max(response_id) FROM responses) WHERE doc_id = 1 AND idx = ?",
+						idx,
+					);
+				}
+			});
+			connection.close();
+			return folder;
+		};
+		const batch = await (await harness(transcriber(), {})).run("transcribe", [await setUp(own(), OTHER)]);
+		expect(batch.documents[0].error).toMatch(/1 page\(s\) transcribed with another schema \(page 2;/);
+		const sync = await (await harness(transcriber(), {})).run("transcribe", [await setUp(OTHER, own())]);
+		expect(sync.documents[0].error).toMatch(/1 page\(s\) transcribed with another schema \(page 1;/);
+		const adopted = await (await harness(transcriber(), {})).run("transcribe", [await setUp(own(), own())]);
+		expect(adopted.documents[0]).toMatchObject({ committed: 2, pending: 0 });
+		expect((adopted.documents[0].warnings ?? []).some((warning) => /no schema hash/.test(warning))).toBe(false);
+	}, 120_000);
+
+	it("checks the done pages of a correction in place that it adopts, not the drafted ones", async () => {
+		const page = (n: number, outcome = "ok") => ({
+			status: "done",
+			content: outcome === "ok" ? `Draft of page ${n}.` : "[No transcribable text]",
+			label: `page_000${n}_pre_processed.jpg`,
+			sourceIndex: n - 1,
+			outcome,
+		});
+		const setUp = (second: ReturnType<typeof page>) => {
+			const root = realPath(tempDir());
+			const pdf = makePdf(join(root, "receipts.pdf"), ["First page", "Second page"]);
+			writeCtDocument(root, "receipts", realPath(pdf), [page(1), second], { kind: "pdf", spec: OTHER });
+			return { root, pdf };
+		};
+		const drafted = setUp(page(2));
+		const worked: string[] = [];
+		const corrected = await (await harness(recorder(worked), { drafts: drafted.root, dpi: 72 })).run("transcribe", [
+			drafted.pdf,
+		]);
+		expect(corrected.documents[0].error).toBeUndefined();
+		expect(worked).toEqual(["p0001", "p0002"]);
+		// The page without text has no draft and would be adopted.
+		const blank = setUp(page(2, "no_text"));
+		const refused = await (await harness(transcriber(), { drafts: blank.root, dpi: 72 })).run("transcribe", [
+			blank.pdf,
+		]);
+		expect(refused.documents[0].error).toMatch(/1 page\(s\) transcribed with another schema \(page 2;/);
 	}, 120_000);
 });

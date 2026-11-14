@@ -482,17 +482,19 @@ export function findConfigFile(explicit: string | undefined, cwd: string): strin
 	return undefined;
 }
 
-/** Merge defaults, file settings, and CLI overrides (later wins; lists from CLI are appended). */
+/**
+ * Merge defaults, file settings, and CLI overrides (later wins). Lists of later layers are appended, except schema
+ * folders, which come first: folders given on the command line are searched before those of the settings file.
+ */
 export function mergeConfig(...layers: Array<Partial<ChronoConfig>>): ChronoConfig {
 	const merged: ChronoConfig = { ...DEFAULT_CONFIG, schemasDirs: [], context: [], contextImages: [] };
 	for (const layer of layers) {
 		for (const [key, value] of Object.entries(layer) as Array<[keyof ChronoConfig, unknown]>) {
 			if (value === undefined) continue;
 			if (LIST_KEYS.has(key)) {
-				(merged as unknown as Record<string, unknown[]>)[key] = [
-					...((merged as unknown as Record<string, unknown[]>)[key] ?? []),
-					...(value as unknown[]),
-				];
+				const current = (merged as unknown as Record<string, unknown[]>)[key] ?? [];
+				(merged as unknown as Record<string, unknown[]>)[key] =
+					key === "schemasDirs" ? [...(value as unknown[]), ...current] : [...current, ...(value as unknown[])];
 			} else {
 				(merged as unknown as Record<string, unknown>)[key] = value;
 			}

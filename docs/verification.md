@@ -48,4 +48,8 @@ mabillon verify entries.json --schema BibliographicCatalogueEntries --source cat
 It also reads the schema recorded next to Mabillon outputs and applies the unit checks
 to every page of an exported transcription `<stem>.mabillon.json`. The recorded schema
 takes precedence over a `schema:` in `mabillon.yaml`; only `--schema` on the command
-line overrides it. A file that is not valid UTF-8 fails with an error.
+line overrides it. When the recorded schema file is gone or has changed, `verify` looks
+the recorded name up in the schema folders and compares the digest of the schema it
+finds with the recorded one. A different digest is refused with exit code 2, since the
+name now leads to another schema; `--schema` checks against a schema regardless. A
+file that is not valid UTF-8 fails with an error.

@@ -24,11 +24,15 @@ and the reason (`load_errors` with `--json`).
 
 ## Selecting a schema
 
-`--schema` accepts a schema name, a file stem, or a path. `--schemas-dir` adds
-directories, and their schemas shadow bundled schemas of the same name. A schema can
-be either a wrapper `{name, strict, schema}` or a bare JSON Schema. A user schema that
-fails to load is reported as an error instead of falling back to a bundled schema of
-the same name.
+`--schema` accepts a schema name, a file stem, or a path. An existing path is used as
+it is. A name or stem is looked up in the user folders, first those of `--schemas-dir`
+(repeatable), then those of `schemas_dirs` in `mabillon.yaml`, and last in the bundled
+schemas. A user schema shadows a bundled schema of the same name. Looking up a name
+or file stem that two user folders hold is an error that names both files: pass the
+file path, rename one file or leave one folder out. `mabillon schemas` reports such
+names. A schema can be either a wrapper `{name, strict, schema}` or a
+bare JSON Schema. A user schema that fails to load is reported as an error instead of
+falling back to a bundled schema of the same name.
 
 ## Rules files
 
