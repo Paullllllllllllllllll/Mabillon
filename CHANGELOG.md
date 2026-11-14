@@ -1,5 +1,14 @@
 # Changelog
 
+- **v0.13.0** (14 November 2026) -- The agent skill moves from
+  `integrations/claude-code/mabillon/` to `skills/mabillon/` and is rewritten as the
+  steps of a job: agree the scope, run a three-unit trial and project its time and
+  cost, run the full job in the background in `--units` ranges that fit the agent's
+  time limit, and report every document, review unit and skipped input. It adds
+  correction mode, `--schemas-dir` and consent before `--force` or `--bash` to the
+  reference, and defers to the README, `docs/` and `--help` for flags and behavior.
+  The README's agent section points to the new path. The tool's code and behavior
+  are unchanged.
 - **v0.12.0** (6 November 2026) -- Breaking: compatibility with ChronoTranscriber and
   ChronoMiner becomes the setting `chrono` (`--chrono`, `--no-chrono`), off by
   default, so that Mabillon works without either tool and touches no store. Without

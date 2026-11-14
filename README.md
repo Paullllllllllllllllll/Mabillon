@@ -1,4 +1,4 @@
-# Mabillon v0.12.0
+# Mabillon v0.13.0
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 
@@ -187,10 +187,12 @@ mabillon verify scans.mabillon.json --json
 ```
 
 [docs/runs.md](docs/runs.md) lists the fields of the JSON results and the exit codes of
-`mabillon status`. `integrations/claude-code/mabillon/SKILL.md` is a ready-made Claude
-Code skill. Copy it to `~/.claude/skills/mabillon/` (or `.claude/skills/mabillon/` in a
-project) and allow `Bash(mabillon:*)` so that Claude Code can start runs, run long ones
-in the background, poll `status`, and read the outputs.
+`mabillon status`. `skills/mabillon/SKILL.md` is a skill for coding agents such as
+Claude Code: it gives the steps of a job (scope, trial, full run, report) and the
+conventions for outputs, `--chrono`, correction mode and schemas. Copy or link the
+folder to `~/.claude/skills/mabillon/` (or `.claude/skills/mabillon/` in a project)
+and allow `Bash(mabillon:*)` so that Claude Code can start runs, run long ones in the
+background, poll `status`, and read the outputs.
 
 ## Documentation
 
