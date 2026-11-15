@@ -1,5 +1,15 @@
 # Changelog
 
+- **v0.14.1** (15 November 2026) -- A `--chrono` run and `--drafts` accept the
+  store of ChronoMiner v1.11.0 and later again. Those versions add two indexes
+  to the store (schema version 4 of the `chronominer` component), which
+  Mabillon refused as an unknown version. A new store is now created at that
+  version, and a store from ChronoMiner v1.4.1 to v1.10 is brought up to date
+  when a run opens it for writing, unless another run holds a document of the
+  store under an unexpired lease; `--drafts` reads it unchanged. A store that
+  Mabillon created or brought up to date needs ChronoMiner v1.11.0 or later.
+  Stores of ChronoTranscriber are unaffected.
+
 - **v0.14.0** (14 November 2026) -- Schema lookup and schema identity are
   stricter. Folders given with `--schemas-dir` are searched before those of
   `schemas_dirs`, a user folder is searched by schema name and by file stem

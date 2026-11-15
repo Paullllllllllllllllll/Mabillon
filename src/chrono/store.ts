@@ -15,6 +15,7 @@ import {
 	CLASSIFICATIONS_V1,
 	CM_DECISIONS_V2,
 	CM_TABLES_V1,
+	CM_TRIGGER_INDEXES_V4,
 	CM_TRIGGERS_V3,
 	CORE_V1,
 	CORE_V2,
@@ -29,7 +30,8 @@ import { Connection, type Param, type Row } from "./sqlite.ts";
  * Mabillon writes them: the same tables and views at the same schema versions, rows written with the semantics of
  * their `common/store.py` (document ids above every dropped one, unit counts and status refreshed in the
  * transaction that changes the units, leases with a holder, generation and expiry, rendered files recorded with
- * their hash). Mabillon refuses a store at any other version and creates a missing one with their exact DDL.
+ * their hash). Mabillon creates a missing store with their exact DDL, brings a store at an older version it reads
+ * up to date as the tools do, and refuses a store at any other version.
  */
 
 export type StoreTool = "chronotranscriber" | "chronominer";
@@ -39,7 +41,7 @@ export const DATABASE_NAMES: Record<StoreTool, string> = {
 	chronominer: "chronominer.sqlite",
 };
 
-/** The component versions of ChronoTranscriber v1.3.1 and ChronoMiner v1.4.1, in their migration order. */
+/** The component versions of ChronoTranscriber (from v1.3.1) and ChronoMiner (from v1.11.0), in migration order. */
 export const COMPONENT_VERSIONS: Record<StoreTool, Array<[string, number]>> = {
 	chronotranscriber: [
 		["core", 2],
@@ -49,8 +51,17 @@ export const COMPONENT_VERSIONS: Record<StoreTool, Array<[string, number]>> = {
 	chronominer: [
 		["core", 2],
 		["classifications", 1],
-		["chronominer", 3],
+		["chronominer", 4],
 	],
+};
+
+/** The oldest version Mabillon reads, for the components where it lies below the current one (ChronoMiner v1.4.1). */
+const OLDEST_VERSIONS: Record<string, number> = { chronominer: 3 };
+
+/** The tool releases whose stores Mabillon reads, as the refusal of another version names them. */
+const READABLE_RELEASES: Record<StoreTool, string> = {
+	chronotranscriber: "v1.3.1 and later",
+	chronominer: "v1.4.1 and later",
 };
 
 const DROPPED_MARK = "dropped_doc_id";
@@ -160,6 +171,7 @@ const STEPS: Record<string, Array<(connection: Connection) => void>> = {
 		},
 		(c) => runStatements(c, CM_DECISIONS_V2),
 		(c) => c.exec(CM_TRIGGERS_V3),
+		(c) => c.exec(CM_TRIGGER_INDEXES_V4),
 	],
 };
 
@@ -179,10 +191,13 @@ function toolLabel(tool: StoreTool): string {
 	return tool === "chronotranscriber" ? "ChronoTranscriber" : "ChronoMiner";
 }
 
-/** Refuse a store whose tables have no `meta`, or whose components are not exactly the pinned versions. */
-function checkSchema(connection: Connection, tool: StoreTool, path: string): "empty" | "ok" {
+/**
+ * The component versions of the store, undefined when it has no table. Refuses a store whose tables have no `meta`,
+ * or whose components are not the tool's at a version Mabillon reads.
+ */
+function checkSchema(connection: Connection, tool: StoreTool, path: string): Map<string, number> | undefined {
 	const tables = tableNames(connection);
-	if (tables.length === 0) return "empty";
+	if (tables.length === 0) return undefined;
 	if (!tables.includes("meta")) {
 		throw new StoreError(
 			`${path} holds tables but no schema version: it is not a ${tool} store and is left as it is.`,
@@ -195,14 +210,41 @@ function checkSchema(connection: Connection, tool: StoreTool, path: string): "em
 	const expected = new Map(COMPONENT_VERSIONS[tool]);
 	const describe = (versions: Map<string, number>) =>
 		[...versions].map(([component, version]) => `${component} ${version}`).join(", ") || "none";
-	const same =
-		found.size === expected.size && [...expected].every(([component, version]) => found.get(component) === version);
-	if (!same) {
+	const readable =
+		found.size === expected.size &&
+		[...expected].every(([component, version]) => {
+			const have = found.get(component);
+			return have !== undefined && have <= version && have >= (OLDEST_VERSIONS[component] ?? version);
+		});
+	if (!readable) {
 		throw new StoreError(
-			`${path} carries schema versions ${describe(found)}; Mabillon writes only the store of ${toolLabel(tool)} ${tool === "chronotranscriber" ? "v1.3.1" : "v1.4.1"} (${describe(expected)}). Open it with that ${toolLabel(tool)} version, or use another output folder. The store is left as it is.`,
+			`${path} carries schema versions ${describe(found)}; Mabillon reads the store of ${toolLabel(tool)} ${READABLE_RELEASES[tool]} (up to ${describe(expected)}). Open it with a ${toolLabel(tool)} or Mabillon version that knows these versions, or use another output folder. The store is left as it is.`,
 		);
 	}
-	return "ok";
+	return found;
+}
+
+/**
+ * Run the steps a store at an older version lacks, as the tools' `_migrate` does: nothing while another run holds
+ * a document of the store under a live lease.
+ */
+function upgradeSchema(connection: Connection, tool: StoreTool, path: string, found: Map<string, number>): void {
+	const pending = COMPONENT_VERSIONS[tool].filter(([component, version]) => (found.get(component) ?? 0) < version);
+	if (pending.length === 0) return;
+	const lease = connection.get(
+		"SELECT count(*) AS count, max(lease_until) AS until FROM documents WHERE lease_run_id IS NOT NULL AND lease_until > ?",
+		nowSeconds(),
+	);
+	if (Number(lease?.count)) {
+		const steps = pending.map(([component, version]) => `'${component}' ${found.get(component)} to ${version}`);
+		throw new StoreError(
+			`${path} needs a schema update (${steps.join(", ")}), but another run holds ${lease?.count} document(s) in this store under a lease until ${isoTime(Number(lease?.until))}; let it finish, then run again. The store is left as it is.`,
+		);
+	}
+	for (const [component, version] of pending) {
+		for (const step of STEPS[component].slice(found.get(component), version)) step(connection);
+		connection.run("UPDATE meta SET version = ? WHERE component = ?", version, component);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -493,14 +535,19 @@ export class ChronoStore {
 		this.connection = connection;
 	}
 
-	/** Open the store of `root`, creating it with the tool's DDL when it is missing or empty; refuse other versions. */
+	/**
+	 * Open the store of `root`, creating it with the tool's DDL when it is missing or empty and bringing an older
+	 * version up to date; refuse other versions.
+	 */
 	static open(root: string, tool: StoreTool, info: RunInfo): ChronoStore {
 		mkdirSync(root, { recursive: true });
 		const path = join(root, DATABASE_NAMES[tool]);
 		const connection = new Connection(path);
 		try {
 			connection.transaction((c) => {
-				if (checkSchema(c, tool, path) === "empty") createSchema(c, tool);
+				const found = checkSchema(c, tool, path);
+				if (found) upgradeSchema(c, tool, path, found);
+				else createSchema(c, tool);
 			});
 		} catch (error) {
 			connection.close();

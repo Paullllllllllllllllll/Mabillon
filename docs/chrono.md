@@ -66,8 +66,15 @@ Standalone mode can extract it.
 
 ## Adoption, leases and refusals
 
-A run opens an existing store only when its schema versions are the ones Mabillon
-writes.
+A run opens an existing store only when Mabillon reads its schema versions: those
+of ChronoTranscriber from v1.3.1 and of ChronoMiner from v1.4.1. A new store gets the
+current versions. A ChronoMiner store from before v1.11.0 is brought up to date when
+a `--chrono` run opens it, with the step ChronoMiner itself would run (two indexes),
+also when the run then refuses its document; while another run holds a document of
+that store under an unexpired lease, the run stops instead and leaves the store as it
+is. Afterwards the store needs ChronoMiner v1.11.0 or later, as does every store
+Mabillon creates: earlier ChronoMiner versions refuse it. `--drafts` reads an older
+store without changing it. A store at any other version is refused.
 
 Before it deletes or changes anything, also under `--force`, a run refuses a store
 document in either of these cases:

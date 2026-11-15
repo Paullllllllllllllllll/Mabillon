@@ -1324,6 +1324,47 @@ describe("mixed stores and refusals", () => {
 		expect(query(database, "SELECT lease_run_id FROM documents")[0].lease_run_id).toBeNull();
 	}, 120_000);
 
+	it("brings a ChronoMiner store of version 3 up to date, but not under a live lease or when only reading", () => {
+		const root = realPath(tempDir());
+		const info = { command: "x", toolVersion: "0", spec: {} };
+		ChronoStore.open(root, "chronominer", info).close(undefined);
+		const database = join(root, "chronominer.sqlite");
+		const names = ["entry_answers_by_chunk", "entry_answers_by_request"];
+		const indexes = () =>
+			query(
+				database,
+				"SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'entry_answers_%' ORDER BY name",
+			).map((row) => row.name);
+		const version = () => query(database, "SELECT version FROM meta WHERE component = 'chronominer'")[0].version;
+		expect(version()).toBe(4);
+		expect(indexes()).toEqual(names);
+		// The store as ChronoMiner v1.4.1 to v1.10 leaves it: version 3, without the two indexes of version 4.
+		const connection = new Connection(database);
+		for (const name of names) connection.exec(`DROP INDEX ${name}`);
+		connection.run("UPDATE meta SET version = 3 WHERE component = 'chronominer'");
+		ChronoStore.inspect(root, "chronominer");
+		expect(version()).toBe(3);
+		connection.run("INSERT INTO runs (run_id, tool, started_at) VALUES ('cm-live', 'chronominer', 'x')");
+		connection.run(
+			"INSERT INTO documents (doc_id, name, tool, input_path, input_sha256, kind, first_run_id, last_run_id, lease_run_id, lease_until) VALUES (1, 'a', 'chronominer', NULL, NULL, NULL, 'cm-live', 'cm-live', 'cm-live', ?)",
+			Date.now() / 1000 + LEASE_TTL,
+		);
+		expect(() => ChronoStore.open(root, "chronominer", info)).toThrow(
+			/needs a schema update \('chronominer' 3 to 4\), but another run holds 1 document/,
+		);
+		expect(version()).toBe(3);
+		expect(indexes()).toEqual([]);
+		connection.run("UPDATE documents SET lease_until = ?", Date.now() / 1000 - 1);
+		ChronoStore.open(root, "chronominer", info).close(undefined);
+		expect(version()).toBe(4);
+		expect(indexes()).toEqual(names);
+		// A version below the oldest one Mabillon reads stays refused.
+		connection.run("UPDATE meta SET version = 2 WHERE component = 'chronominer'");
+		connection.close();
+		expect(() => ChronoStore.open(root, "chronominer", info)).toThrow(/carries schema versions .*chronominer 2/);
+		expect(() => ChronoStore.inspect(root, "chronominer")).toThrow(/carries schema versions .*chronominer 2/);
+	});
+
 	it("replaces the chunks of a ChronoMiner document only under --force when the chunking changed", async () => {
 		const root = tempDir();
 		const text = join(root, "prices.md");

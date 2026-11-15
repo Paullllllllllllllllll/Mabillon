@@ -1,7 +1,8 @@
 /**
- * The store schema of ChronoTranscriber v1.3.1 and ChronoMiner v1.4.1, copied verbatim from their migration steps
- * (`common/store.py`, `common/classify_store.py`, `output/store.py`). Mabillon creates a fresh store by running
- * the same steps in the same order and refuses a store at any other version.
+ * The store schema of ChronoTranscriber (from v1.3.1) and ChronoMiner (from v1.11.0), copied verbatim from their
+ * migration steps (`common/store.py`, `common/classify_store.py`, `output/store.py`). Mabillon creates a fresh
+ * store by running the same steps in the same order and brings a ChronoMiner store of v1.4.1 to v1.10 up to date
+ * with the missing step.
  */
 
 /** `common/store.py` _CORE_V1. */
@@ -508,4 +509,10 @@ BEGIN
         AND ordinal = OLD.idx + 1 AND stale = 0
     );
 END;
+`;
+
+/** ChronoMiner `output/store.py` _TRIGGER_INDEXES_V4 (v1.11.0). */
+export const CM_TRIGGER_INDEXES_V4 = `
+CREATE INDEX entry_answers_by_chunk ON classification_rows (doc_id, unit, ordinal);
+CREATE INDEX entry_answers_by_request ON classification_rows (doc_id, request_sha256);
 `;
