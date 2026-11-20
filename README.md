@@ -240,7 +240,7 @@ Mabillon follows semantic versioning; release notes are in
 
 ## Contact
 
-Mabillon is written and maintained by Paul Götz, Sociological Institute,
+Mabillon is written and maintained by Paul Götz, Department of Sociology,
 University of Zurich. Write to
 [goetz@soziologie.uzh.ch](mailto:goetz@soziologie.uzh.ch) with questions, bug
 reports or collaboration requests.
