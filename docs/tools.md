@@ -17,8 +17,10 @@ pi's shell tool, available only with `--bash`. See [bash](#bash-shell) below.
 ### view
 
 Available in image modes. `view` shows the current, previous or next page, whole or as
-a zoomed region. `box` gives one region in page fractions, and `boxes` gives up to four
-regions in one call, one image each. Regions are magnified up to 8x. Optional
+a zoomed region; in extraction with `--look-ahead <n>`, the next n pages
+([runs.md](runs.md#text-chunks)). `box` gives one region in page fractions, and
+`boxes` gives up to four regions in one call, one image each. Regions are magnified up
+to 8x. Optional
 enhancements are contrast, threshold and sharpen, applied in the order given, plus
 rotation and a labelled coordinate grid.
 
@@ -57,7 +59,11 @@ changed entry and the chunk coverage.
 ### verify
 
 `verify` validates the current unit file. With `final=true` it commits the unit. The
-checks are listed in [verification.md](verification.md).
+checks are listed in [verification.md](verification.md). In extraction, `carry_over`
+leaves a note for the units that hold the continuation of an entry recorded in this
+one. With `--look-ahead` above 1, `carry_over_end` names the unit where that
+continuation ends; it must lie within reach, and it is accepted only with `final=true`
+and `carry_over`.
 
 ### python
 
@@ -66,7 +72,9 @@ the agent writes, with the work folder as current folder.
 
 The current, previous and next page are written as lossless PNGs at full resolution to
 `source/<id>.png`. Their paths are in `source/pages.json` and in the variables
-`MABILLON_PAGE`, `MABILLON_PREVIOUS_PAGE` and `MABILLON_NEXT_PAGE`.
+`MABILLON_PAGE`, `MABILLON_PREVIOUS_PAGE` and `MABILLON_NEXT_PAGE`. `--look-ahead`
+does not extend this to later pages, which only `view` shows; without `view` the agent
+looks one page ahead.
 
 `scratch/pagetools.py` is copied from `python/pagetools.py` at the first session. Its
 helpers cover crops, magnification, background removal, binarization (Otsu, Sauvola),

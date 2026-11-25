@@ -4,7 +4,7 @@ import type { ChronoConfig, Mode, ServiceTier, ToolName } from "../config.ts";
 import type { ImageProfile } from "../inputs/image-profile.ts";
 import type { ImageLoader, PreparedImage } from "../inputs/images.ts";
 import type { OpenRouterPreferences } from "../routing.ts";
-import type { LoadedSchema } from "../schemas/registry.ts";
+import { boundaryPolicy, type LoadedSchema } from "../schemas/registry.ts";
 import type { PythonRunner } from "./python-tool.ts";
 import {
 	type DocPaths,
@@ -71,6 +71,22 @@ export function unitById(runtime: SessionRuntime, id: string): UnitRecord | unde
 /** Neighbor in document order (not batch order). */
 export function neighbor(runtime: SessionRuntime, unit: UnitRecord, offset: number): UnitRecord | undefined {
 	return runtime.state.units.find((candidate) => candidate.index === unit.index + offset);
+}
+
+/**
+ * How many pages ahead the agent may view to complete an entry: look_ahead in extraction from page images with the
+ * "complete" boundary rule and the view tool (python reaches the next page only); otherwise 1.
+ */
+export function pageLookAhead(where: {
+	mode: Mode;
+	inputKind: InputKind;
+	schema: LoadedSchema;
+	config: Pick<ChronoConfig, "lookAhead">;
+	tools: ReadonlySet<ToolName>;
+}): number {
+	if (where.mode !== "extract" || where.inputKind !== "images" || !where.tools.has("view")) return 1;
+	if (boundaryPolicy(where.schema) !== "complete") return 1;
+	return where.config.lookAhead;
 }
 
 /** The canonical copy of a finished unit (immune to later edits in work/). */

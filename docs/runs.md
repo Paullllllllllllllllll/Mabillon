@@ -176,6 +176,21 @@ continues, the agent may read up to two chunks ahead to complete it, and it leav
 carry-over note so that the next chunks skip the continuation. Pages work the same
 way with the previous and the next page.
 
+In extraction from pages with the `"complete"` boundary rule, `--look-ahead <n>`
+(`look_ahead`, 1 to 4, default 1) lets the agent view up to n pages ahead. This covers
+an entry that fills a whole page before it ends, and a continuation that lies beyond
+inserted leaves or plates, which the agent skips over. The carry-over note quotes the
+last words of the continuation, and `verify` takes the id of the page where it ends
+as `carry_over_end`. The note then reaches every page up to that one; without the id,
+only the next page. A page before the end is told that the content belonging to the
+earlier entry is recorded there and that an entry beginning on it is recorded on it;
+an empty such page is confirmed after a second look like any other. A later page
+committed before the page where a long entry begins keeps what it recorded, so pages
+of a document are best processed in order. With two context images retained in the
+request, the current page and four pages ahead stay inside the smallest per-request
+image limit of the supported models (eight images). A value above 1 is part of the
+run's settings, so a run resumes only with the value it started with.
+
 ## Status and results
 
 `mabillon status` reads the state of runs without a model. It finds the runs in the

@@ -1,5 +1,19 @@
 # Changelog
 
+- **v0.15.0** (25 November 2026) -- Extraction from page images can complete an
+  entry from more than the next page. `--look-ahead <n>` (`look_ahead`, 1 to 4,
+  default 1) lets the agent view up to n pages ahead with the `"complete"`
+  boundary rule, for an entry that fills a whole page before it ends on a third,
+  or whose continuation lies beyond inserted leaves or plates. `verify` then
+  takes `carry_over_end`, the id of the page where the continuation ends, within
+  reach and only with `final=true` and `carry_over`; it is stored beside the
+  note (`carry_over_end` in the sidecar), and the note reaches every page up to
+  that one. A page before the end is told that the content belonging to the
+  earlier entry is recorded there and that an entry beginning on it is recorded
+  on it. The python tool still reaches the next page only. A value above 1 is
+  recorded in the run's experiment settings and changes the system prompt, so a
+  run resumes only with the value it started with; under the default, runs
+  started with earlier versions resume unchanged.
 - **v0.14.2** (25 November 2026) -- A run whose `--model` is missing from pi's
   cached model catalog asks pi once to update the catalog, waits at most 30
   seconds, and looks the model up again. pi updated its cache only in

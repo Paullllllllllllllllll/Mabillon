@@ -100,6 +100,11 @@ read it before a run, or pass `--config` with an empty file. `--no-force`,
 - Correction mode: `--drafts <chronotranscriber.sqlite | chronominer.sqlite | output
   root>` seeds the units from another tool's run, and the agent corrects them; a
   resume needs `--drafts` again.
+- Extraction from page images: entries are completed from the next page. When an
+  entry can run over more pages than that (a long entry, inserted leaves or plates),
+  `--look-ahead <n>` (1 to 4) lets the agent view up to n pages ahead; a resume needs
+  the same value. Process such a document's pages in order: a page committed before
+  the page where a long entry begins keeps what it recorded.
 - Schemas: the bundled transcription and extraction schemas are copies; `--schemas-dir
   <dir>` adds a folder whose file of the same name shadows the copy, as for a run that
   shares a store with a ChronoTranscriber or ChronoMiner run (a ChronoTranscriber store

@@ -7,7 +7,7 @@ import { lastLines, readUtf8File, truncate } from "../util.ts";
 import { formatIssue } from "../verify/issues.ts";
 import { parseTranscriptionUnit } from "../verify/rules.ts";
 import { canKeepNotes, closingInstruction, rejectionList } from "./notices.ts";
-import { neighbor, readCommitted, type SessionRuntime } from "./runtime.ts";
+import { neighbor, pageLookAhead, readCommitted, type SessionRuntime, unitById } from "./runtime.ts";
 import { chunkFile, isDone, sha256Text, type UnitRecord, unitFile } from "./state.ts";
 
 export type MessageContent = Array<TextContent | ImageContent>;
@@ -68,21 +68,32 @@ export function previousTail(runtime: SessionRuntime, unit: UnitRecord): string 
 	}
 }
 
+/** How many units ahead an entry may be completed: two chunks, or the look-ahead of pages (default 1). */
+function reach(runtime: SessionRuntime): number {
+	return runtime.inputKind === "images" ? pageLookAhead(runtime) : 2;
+}
+
 /**
- * Carry-over notes from earlier units. Pages can only be completed from the next page, so only the previous page's
- * note applies; text chunks may be completed up to two chunks ahead, so a note from two chunks back applies only
- * if its entry actually reaches this chunk.
+ * Carry-over notes from earlier units within reach. A page note goes to the next unit, or with `carryOverEnd` to every
+ * unit up to that one (the ones before it are told that the entry continues through them). A chunk note from two
+ * chunks back applies only if its entry actually reaches this chunk.
  */
 export function carryOverNote(runtime: SessionRuntime, unit: UnitRecord): string | undefined {
 	const notes: string[] = [];
-	const offsets = runtime.inputKind === "images" ? [1] : [2, 1];
-	for (const offset of offsets) {
+	const limit = reach(runtime);
+	for (let offset = limit; offset >= 1; offset--) {
 		const earlier = neighbor(runtime, unit, -offset);
 		if (!earlier?.carryOver) continue;
+		const endUnit =
+			runtime.inputKind === "images" && earlier.carryOverEnd ? unitById(runtime, earlier.carryOverEnd) : undefined;
+		const end = runtime.inputKind === "images" ? (endUnit ? endUnit.index - earlier.index : 1) : undefined;
+		if (end !== undefined && offset > end) continue;
 		notes.push(
-			offset === 1
-				? `Carry-over from ${earlier.id}: an entry recorded there continues into this unit (${earlier.carryOver}). Skip the part of this unit that belongs to it.`
-				: `Carry-over from ${earlier.id}: an entry recorded there continues into the following units (${earlier.carryOver}). Only if that entry reaches this unit, skip the part of this unit that belongs to it; otherwise ignore this note.`,
+			end !== undefined && offset < end
+				? `Carry-over from ${earlier.id}: an entry recorded there continues through this unit and ends in ${earlier.carryOverEnd} (${earlier.carryOver}). The content of this unit that belongs to that entry is recorded there; an entry that begins in this unit is recorded here.`
+				: offset === 1 || offset === end
+					? `Carry-over from ${earlier.id}: an entry recorded there continues into this unit (${earlier.carryOver}). Skip the part of this unit that belongs to it.`
+					: `Carry-over from ${earlier.id}: an entry recorded there continues into the following units (${earlier.carryOver}). Only if that entry reaches this unit, skip the part of this unit that belongs to it; otherwise ignore this note.`,
 		);
 	}
 	return notes.length > 0 ? notes.join("\n") : undefined;

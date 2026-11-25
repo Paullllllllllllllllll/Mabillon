@@ -55,6 +55,11 @@ export interface ChronoConfig {
 	maxImagePx?: number;
 	/** Approximate size of text chunks for text inputs. */
 	chunkTokens: number;
+	/**
+	 * Extraction from page images with the "complete" boundary rule: how many pages ahead the agent may view to
+	 * complete an entry (1 to MAX_LOOK_AHEAD).
+	 */
+	lookAhead: number;
 	/** Documents processed in parallel. */
 	concurrency: number;
 	/** Context text files applied to every document. */
@@ -106,6 +111,12 @@ export interface ChronoConfig {
 	draftsDocument?: string;
 }
 
+/**
+ * Upper bound of lookAhead: with two context images retained in the request, the current page and four pages ahead
+ * stay inside the smallest per-request image limit of the supported models (eight images).
+ */
+export const MAX_LOOK_AHEAD = 4;
+
 export const DEFAULT_CONFIG: ChronoConfig = {
 	chrono: false,
 	schemasDirs: [],
@@ -118,6 +129,7 @@ export const DEFAULT_CONFIG: ChronoConfig = {
 	maxRenderPixels: 30_000_000,
 	imageQuality: "max",
 	chunkTokens: 2500,
+	lookAhead: 1,
 	concurrency: 1,
 	context: [],
 	contextImages: [],
@@ -162,6 +174,7 @@ const KEY_ALIASES: Record<string, keyof ChronoConfig> = {
 	maximagepx: "maxImagePx",
 	imagequality: "imageQuality",
 	chunktokens: "chunkTokens",
+	lookahead: "lookAhead",
 	concurrency: "concurrency",
 	context: "context",
 	contextimages: "contextImages",
@@ -367,6 +380,14 @@ export function normalizeKey(key: string): keyof ChronoConfig | undefined {
 
 /** Coerce and validate one config value. Relative paths are resolved against `baseDir`. */
 export function coerceConfigValue(key: keyof ChronoConfig, value: unknown, baseDir: string): unknown {
+	if (key === "lookAhead") {
+		const text = String(value).trim();
+		const num = typeof value === "number" ? value : text === "" ? Number.NaN : Number(text);
+		if (!Number.isInteger(num) || num < 1 || num > MAX_LOOK_AHEAD) {
+			throw new Error(`Config "lookAhead" must be a whole number from 1 to ${MAX_LOOK_AHEAD}, not "${value}"`);
+		}
+		return num;
+	}
 	if (key === "groundingThreshold") {
 		// No separator stripping: "0,8" must not become 8.
 		const text = String(value).trim();

@@ -20,7 +20,7 @@ import type { MessageContent } from "./agent/messages.ts";
 import { sessionIntro } from "./agent/messages.ts";
 import { buildSystemPrompt } from "./agent/prompts.ts";
 import { bundledHelperSha256, localPythonRunner, type PythonRunner, pythonEnvironment } from "./agent/python-tool.ts";
-import { readCommitted, type SessionRuntime, type UnitSources } from "./agent/runtime.ts";
+import { pageLookAhead, readCommitted, type SessionRuntime, type UnitSources } from "./agent/runtime.ts";
 import { checkSandbox, resetSandbox, sandboxedPythonRunner } from "./agent/sandbox.ts";
 import {
 	acquireLock,
@@ -548,6 +548,7 @@ function reopenDamaged(paths: DocPaths, state: DocState): string[] {
 		unit.issues = undefined;
 		unit.closedReason = undefined;
 		unit.carryOver = undefined;
+		unit.carryOverEnd = undefined;
 		unit.committedAt = undefined;
 		unit.toolCalls = 0;
 		unit.views = 0;
@@ -1080,6 +1081,7 @@ function experimentRecord(
 	const entries = mode === "extract" && resolveAddEntries(schema).setup !== undefined;
 	const tools = effectiveTools(config, { mode, inputKind, entries });
 	checkToolSet(tools, { mode, inputKind });
+	const lookAhead = pageLookAhead({ mode, inputKind, schema, config, tools: new Set(tools) });
 	const settings: Record<string, unknown> = {
 		unitsPerSession: config.unitsPerSession,
 		compactAtTokens: config.compactAtTokens,
@@ -1092,6 +1094,8 @@ function experimentRecord(
 		imageFallback: config.imageFallback,
 		// Correction mode is a different arm; the drafts themselves are recorded per unit.
 		...(config.drafts !== undefined ? { correction: true } : {}),
+		// Recorded only where it takes effect and differs from 1, so that runs from before the setting resume.
+		...(lookAhead > 1 ? { lookAhead } : {}),
 		...(doc.kind === "pdf" ? { dpi: config.dpi, maxRenderPixels: config.maxRenderPixels } : {}),
 		...(inputKind === "text"
 			? { chunkTokens: config.chunkTokens, allowPartialRanges: config.allowPartialRanges }

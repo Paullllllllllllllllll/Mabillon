@@ -285,6 +285,7 @@ function writeExtraction(
 			...runInfo(unit),
 		};
 		if (unit.carryOver) record.carry_over = unit.carryOver;
+		if (unit.carryOverEnd) record.carry_over_end = unit.carryOverEnd;
 		if (unit.closedReason) record.closed_reason = unit.closedReason;
 		const issues = unitIssues(unit);
 		if (issues) record.issues = issues;

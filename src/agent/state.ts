@@ -26,6 +26,8 @@ export interface UnitRecord {
 	endLine?: number;
 	/** Note from the agent about text at the start of the next unit(s) that belongs to an entry recorded here. */
 	carryOver?: string;
+	/** Page units with a look-ahead above 1: the unit where that continuation ends (default: the next unit). */
+	carryOverEnd?: string;
 	/** Issues remaining when the unit was committed or closed. */
 	issues?: Issue[];
 	/** Why a unit was closed without a passing verify (tool budget, agent stopped, unreadable page). */

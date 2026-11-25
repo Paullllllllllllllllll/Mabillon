@@ -61,7 +61,7 @@ import {
 	shownFiles,
 	tail,
 } from "./python-tool.ts";
-import { committedPath, neighbor, type SessionRuntime } from "./runtime.ts";
+import { committedPath, neighbor, pageLookAhead, type SessionRuntime } from "./runtime.ts";
 import { sha256Text, type UnitRecord, unitFile } from "./state.ts";
 
 export interface FinishedUnit {
@@ -266,6 +266,7 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 	// a model overwrote four drafted recipes with an empty envelope). Track the most entries any draft had.
 	const entriesField = runtime.mode === "extract" ? envelopeInfo(runtime.schema.schema).entriesField : undefined;
 	const fragments = runtime.mode === "extract" && boundaryPolicy(runtime.schema) === "fragments";
+	const lookAhead = pageLookAhead(runtime);
 	// Shared by add_entries and update_entry; a schema the tools cannot be set up for runs without them (the driver
 	// logs why).
 	const entrySetup = runtime.mode === "extract" ? resolveAddEntries(runtime.schema).setup : undefined;
@@ -371,12 +372,19 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 		return parts.join(", ");
 	};
 
-	const commit = (unit: UnitRecord, content: string, warnings: Issue[], carryOver: string | undefined) => {
+	const commit = (
+		unit: UnitRecord,
+		content: string,
+		warnings: Issue[],
+		carryOver: string | undefined,
+		carryOverEnd: string | undefined,
+	) => {
 		storeCommitted(unit, content);
 		unit.status = "committed";
 		unit.issues = warnings.length > 0 ? warnings : undefined;
 		// Schemas that record page-local fragments have no carry-over: the next unit records its own part.
 		unit.carryOver = carryOver?.trim() && !fragments ? carryOver.trim() : undefined;
+		unit.carryOverEnd = unit.carryOver ? carryOverEnd : undefined;
 		unit.closedReason = undefined;
 		// Unresolved rejections are kept as a warning issue; the open list ends with the commit.
 		unit.rejections = undefined;
@@ -469,9 +477,21 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 					Type.String({
 						description: fragments
 							? "Not used with this schema: entries crossing a unit boundary are recorded in each unit as fragments."
-							: "Extraction only, with final=true: describe text at the start of the next unit(s) that belongs to an entry already recorded in this unit (quote where it ends). Those units will skip it.",
+							: lookAhead > 1
+								? "Extraction only, with final=true: describe text of the following unit(s) that belongs to an entry already recorded in this unit (quote its last words). Those units will skip it."
+								: "Extraction only, with final=true: describe text at the start of the next unit(s) that belongs to an entry already recorded in this unit (quote where it ends). Those units will skip it.",
 					}),
 				),
+				// Offered only where an entry may be completed from more than the next page.
+				...(lookAhead > 1
+					? {
+							carry_over_end: Type.Optional(
+								Type.String({
+									description: `With final=true and carry_over, when the continuation ends beyond the next unit: the id of the unit where it ends (up to ${lookAhead} units ahead). Every unit up to it gets the note; without it, only the next unit.`,
+								}),
+							),
+						}
+					: {}),
 			}),
 			executionMode: "sequential",
 			async execute(_toolCallId, params) {
@@ -482,6 +502,29 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 						details: undefined,
 						terminate: true,
 					};
+				}
+				// A blank value is not an omission: it is rejected below like any id out of reach.
+				const carryOverEnd =
+					lookAhead > 1 ? (params as { carry_over_end?: string }).carry_over_end?.trim() : undefined;
+				if (carryOverEnd !== undefined) {
+					const reachable = Array.from({ length: lookAhead }, (_, i) => neighbor(runtime, unit, i + 1))
+						.filter((candidate): candidate is UnitRecord => candidate !== undefined)
+						.map((candidate) => candidate.id);
+					const problem =
+						!params.final || !params.carry_over?.trim()
+							? "carry_over_end is accepted only with final=true and carry_over"
+							: reachable.includes(carryOverEnd)
+								? undefined
+								: reachable.length > 0
+									? `carry_over_end must be a later unit within reach: ${reachable.join(", ")} (not "${carryOverEnd}")`
+									: `carry_over_end cannot be set: ${unit.id} is the last unit`;
+					if (problem) {
+						return {
+							content: [{ type: "text", text: `Verify was not run: ${problem}.` }],
+							details: undefined,
+							isError: true,
+						};
+					}
 				}
 				const file = unitFile(runtime.mode, unit);
 				const content = readUnit(unit);
@@ -613,7 +656,7 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 						isError: true,
 					};
 				}
-				commit(unit, content, warnings, params.carry_over);
+				commit(unit, content, warnings, params.carry_over, carryOverEnd);
 				advance();
 				const next = current();
 				const warningText = warnings.length > 0 ? ` with ${warnings.length} warning(s) noted` : "";
@@ -881,7 +924,7 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 			const viewTool = defineTool({
 				name: "view",
 				label: "View",
-				description: `Show a page image: a region at full resolution (box), or up to ${MAX_VIEW_BOXES} regions in one call (boxes, one image each), optionally magnified, enhanced, rotated, or with a coordinate grid; or the whole page. Available pages: the current page, the previous page and the next page. The current page is already attached to the unit message.`,
+				description: `Show a page image: a region at full resolution (box), or up to ${MAX_VIEW_BOXES} regions in one call (boxes, one image each), optionally magnified, enhanced, rotated, or with a coordinate grid; or the whole page. Available pages: the current page, the previous page and ${lookAhead > 1 ? `the next ${lookAhead} pages` : "the next page"}. The current page is already attached to the unit message.`,
 				parameters: Type.Object({
 					unit: Type.Optional(Type.String({ description: "Page id, e.g. p0007. Default: the current page." })),
 					box: Type.Optional(
@@ -921,7 +964,8 @@ export function createChronoExtension(runtime: SessionRuntime): ChronoExtensionH
 							terminate: true,
 						};
 					}
-					const allowed = [active, neighbor(runtime, active, -1), neighbor(runtime, active, 1)].filter(
+					const ahead = Array.from({ length: lookAhead }, (_, i) => neighbor(runtime, active, i + 1));
+					const allowed = [active, neighbor(runtime, active, -1), ...ahead].filter(
 						(unit): unit is UnitRecord => unit !== undefined,
 					);
 					const target = params.unit ? allowed.find((unit) => unit.id === params.unit) : active;

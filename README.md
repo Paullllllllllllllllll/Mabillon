@@ -1,4 +1,4 @@
-# Mabillon v0.14.2
+# Mabillon v0.15.0
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 

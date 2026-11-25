@@ -2,6 +2,7 @@ import type { ChronoConfig, Mode, ToolName } from "../config.ts";
 import type { ContextBundle } from "../context.ts";
 import { boundaryPolicy, type LoadedSchema } from "../schemas/registry.ts";
 import { canKeepNotes, listing } from "./notices.ts";
+import { pageLookAhead } from "./runtime.ts";
 import type { InputKind } from "./state.ts";
 
 export interface PromptOptions {
@@ -76,10 +77,13 @@ function completionSection(options: PromptOptions, unitWord: string): string {
 
 function toolsSection(options: PromptOptions): string {
 	const { tools } = options;
+	const lookAhead = pageLookAhead(options);
 	const lines = ["## Tools"];
 	if (options.inputKind === "images" && tools.has("view")) {
 		lines.push(
-			"- view: the current page is attached to its unit message at the highest resolution the model accepts, so you do not need to view it whole again. `box` ({x, y, w, h} as fractions of page width and height, origin top-left) zooms into a region at full resolution, `boxes` shows up to four regions in one call (e.g. consecutive bands of the page), and `scale` magnifies up to 8x; `grid: true` overlays labelled coordinates to help choose boxes; `enhance` (contrast, grayscale, sharpen, threshold, invert) and `rotate` help with faint, stained or rotated text. The previous and the next page can be viewed with `unit` (catchwords, words or entries running across pages).",
+			"- view: the current page is attached to its unit message at the highest resolution the model accepts, so you do not need to view it whole again. `box` ({x, y, w, h} as fractions of page width and height, origin top-left) zooms into a region at full resolution, `boxes` shows up to four regions in one call (e.g. consecutive bands of the page), and `scale` magnifies up to 8x; `grid: true` overlays labelled coordinates to help choose boxes; `enhance` (contrast, grayscale, sharpen, threshold, invert) and `rotate` help with faint, stained or rotated text. " +
+				(lookAhead > 1 ? `The previous page and the next ${lookAhead} pages` : "The previous and the next page") +
+				" can be viewed with `unit` (catchwords, words or entries running across pages).",
 		);
 		lines.push(
 			"- To keep requests small, images of earlier units are removed from the conversation once their unit is committed; view a page again if you need it.",
@@ -239,6 +243,7 @@ function extractionPrompt(options: PromptOptions): string {
 	const unitWord = isImages ? "page" : "chunk";
 	const example = isImages ? "p0007" : "c0007";
 	const correcting = options.config.drafts !== undefined;
+	const lookAhead = pageLookAhead(options);
 	const task = correcting
 		? `correct an erroneous extraction of each ${unitWord} so that it records every entry of the kind defined by the schema below, as JSON validated against that schema`
 		: "record every entry of the kind defined by the schema below, as JSON validated against that schema";
@@ -262,14 +267,18 @@ ${
 	boundaryPolicy(options.schema) === "fragments"
 		? `- Record what this ${unitWord} shows: an entry that begins on an earlier ${unitWord} or continues onto the next one is recorded here as its own entry with only this ${unitWord}'s part, flagged as a fragment (the schema's fragment field). Fields whose evidence is outside this ${unitWord} are null.
 - Do not complete fragments from neighboring ${unitWord}s and do not skip continuations at the top of a ${unitWord}; do not pass \`carry_over\`.`
-		: `- An entry belongs to the ${unitWord} where it begins. If it continues into the next ${unitWord}, ${
-				// view (image units) and read (text units) are mandatory tools, so the next unit can always be looked at.
-				isImages
-					? options.tools.has("view")
-						? "view the next page (view with unit=<next id>) to complete it, record the complete entry in the current unit,"
-						: "look at the next page with python (pagetools.page('next')) to complete it, record the complete entry in the current unit,"
-					: "read the next chunk (source/<next id>.txt; the unit message already shows its first lines, and you may read up to two chunks ahead) to complete it, record the complete entry in the current unit,"
-			} and pass \`carry_over\` to verify(final=true) describing where the continuation ends in the next ${unitWord} (quote its last words).
+		: lookAhead > 1
+			? `- An entry belongs to the page where it begins. If it continues onto the following pages, view them (view with unit=<id>, up to ${lookAhead} pages ahead) to complete it, record the complete entry in the current unit, and pass \`carry_over\` to verify(final=true) quoting the last words of the continuation; if it ends beyond the next page, also pass the id of the page where it ends as \`carry_over_end\`.
+- Pages between the start and the end of an entry may hold further matter that belongs to it; do not record that as entries of their own. A page that is no part of the running text, such as an inserted leaf or a plate, is skipped over when completing an entry.
+- If a page begins with the continuation of an entry recorded in an earlier unit, or lies wholly inside it, the carry-over note in the unit message tells you; skip that part.`
+			: `- An entry belongs to the ${unitWord} where it begins. If it continues into the next ${unitWord}, ${
+					// view (image units) and read (text units) are mandatory tools, so the next unit can always be looked at.
+					isImages
+						? options.tools.has("view")
+							? "view the next page (view with unit=<next id>) to complete it, record the complete entry in the current unit,"
+							: "look at the next page with python (pagetools.page('next')) to complete it, record the complete entry in the current unit,"
+						: "read the next chunk (source/<next id>.txt; the unit message already shows its first lines, and you may read up to two chunks ahead) to complete it, record the complete entry in the current unit,"
+				} and pass \`carry_over\` to verify(final=true) describing where the continuation ends in the next ${unitWord} (quote its last words).
 - If a ${unitWord} begins with the continuation of an entry recorded in the previous unit, the carry-over note in the unit message tells you; skip that part.`
 }
 

@@ -882,6 +882,7 @@ export class ChronoSync {
 			unit.issues = undefined;
 			unit.closedReason = undefined;
 			unit.carryOver = undefined;
+			unit.carryOverEnd = undefined;
 			unit.committedAt = new Date().toISOString();
 			unit.adopted = { tool: row.tool, runId: row.run_id, model: row.model, outcome: row.outcome ?? undefined };
 			adopted++;
@@ -1168,6 +1169,7 @@ function reopenUnit(unit: UnitRecord): void {
 		closedReason: undefined,
 		issues: undefined,
 		carryOver: undefined,
+		carryOverEnd: undefined,
 		toolCalls: 0,
 		views: 0,
 		verifyRuns: 0,

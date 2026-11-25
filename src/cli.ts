@@ -7,6 +7,7 @@ import {
 	coerceConfigValue,
 	findConfigFile,
 	loadConfigFile,
+	MAX_LOOK_AHEAD,
 	type Mode,
 	mergeConfig,
 	normalizeKey,
@@ -64,6 +65,8 @@ Inputs and context:
   --image-quality <level>      max (default; each provider's full-resolution mode), high, or standard
   --max-image-px <n>           cap the longest edge of images sent to the model (default: model limit)
   --chunk-tokens <n>           approximate size of text chunks (default 2500)
+  --look-ahead <n>             extract from page images: how many pages ahead the agent may view to complete an
+                               entry that begins on the current page (default 1, at most ${MAX_LOOK_AHEAD})
   --grounding-threshold <x>    share of a verbatim field's word trigrams that must occur in the source
                                text; below it a grounding warning is recorded (default 0.8)
 

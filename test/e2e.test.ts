@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
@@ -319,4 +319,158 @@ describe("extraction from text", () => {
 		const first = messageText(harness.faux.requests[0].messages[harness.faux.requests[0].messages.length - 1]);
 		expect(first).toContain("(Following context, start of c0002");
 	}, 120_000);
+});
+
+describe("extraction from page images", () => {
+	function writeRecipeSchema(root: string): string {
+		const schemaDir = join(root, "schemas");
+		mkdirSync(schemaDir, { recursive: true });
+		writeFileSync(join(schemaDir, "mini.json"), JSON.stringify(RECIPE_SCHEMA));
+		return schemaDir;
+	}
+
+	const recipe = (title: string) => ({ title_original: title, text_original: `${title} Take ſpinage and parſley.` });
+
+	/**
+	 * Scripted agent: on p0001 it views the pages in `views`, records one entry and commits with the verify arguments
+	 * of `finals` (the next one after each refusal); p0002 gets `middle` entries, later pages one entry each. A refused
+	 * verify is repeated, so an empty page is confirmed after its second look.
+	 */
+	function scriptedAgent(options: { views?: string[]; finals: Array<Record<string, unknown>>; middle?: object[] }) {
+		const { views = [], finals, middle = [recipe("B")] } = options;
+		const unitMessages = new Map<string, string>();
+		const viewResults: string[] = [];
+		const verifyResults: string[] = [];
+		let firstVerifies = 0;
+		const verify = (unit: string) =>
+			call("verify", unit === "p0001" ? finals[Math.min(firstVerifies++, finals.length - 1)] : { final: true });
+		const responder = (context: TranscriptContext) => {
+			const last = context.messages[context.messages.length - 1];
+			const text = messageText(last);
+			const unit = currentUnit(context);
+			if (!unit) return say("Nothing to do.");
+			const write = (entries: object[]) =>
+				call("write", {
+					path: `units/${unit}.json`,
+					content: JSON.stringify({ contains_no_content_of_requested_type: entries.length === 0, entries }),
+				});
+			if (last.role === "user") {
+				unitMessages.set(unit, text);
+				if (unit === "p0001") return views.length > 0 ? call("view", { unit: views[0] }) : write([recipe("A")]);
+				return write(unit === "p0002" ? middle : [recipe("C")]);
+			}
+			if (last.role === "toolResult" && last.toolName === "view") {
+				viewResults.push(text);
+				const next = views[viewResults.length];
+				return next ? call("view", { unit: next }) : write([recipe("A")]);
+			}
+			if (last.role === "toolResult" && last.toolName === "write") return verify(unit);
+			if (last.role === "toolResult" && last.toolName === "verify") {
+				verifyResults.push(`${unit}: ${text}`);
+				if (last.isError) return verify(unit);
+			}
+			return say("done");
+		};
+		return { responder, unitMessages, viewResults, verifyResults };
+	}
+
+	async function extractPages(
+		pages: number,
+		agent: ReturnType<typeof scriptedAgent>,
+		overrides: Partial<ChronoConfig>,
+	) {
+		const root = tempDir();
+		const folder = await makeImageFolder(join(root, "catalogue"), pages);
+		const harness = await setup(agent.responder, {
+			schema: "MiniRecipes",
+			schemasDirs: [writeRecipeSchema(root)],
+			out: join(root, "out"),
+			...overrides,
+		});
+		const summary = await harness.run("extract", [folder]);
+		const state = JSON.parse(
+			readFileSync(join(workingDir(join(root, "out"), "catalogue"), "run", "state.json"), "utf8"),
+		) as DocState;
+		return { harness, summary, state, sidecar: readSidecar(join(root, "out"), "catalogue") };
+	}
+
+	it("completes an entry over three pages with look_ahead 2 and passes its note to both following pages", async () => {
+		const carry = "the entry ends with 'in a fine paste.'";
+		const agent = scriptedAgent({
+			views: ["p0002", "p0003"],
+			finals: [{ final: true, carry_over: carry, carry_over_end: "p0003" }],
+			middle: [],
+		});
+		// One unit per session: the note reaches the later pages through the handoff to a fresh session.
+		const { harness, summary, state, sidecar } = await extractPages(3, agent, { lookAhead: 2, unitsPerSession: 1 });
+		expect(summary.documents[0]).toMatchObject({ committed: 3, needsReview: 0 });
+		expect(agent.viewResults).toHaveLength(2);
+		expect(agent.viewResults.some((result) => /not available/.test(result))).toBe(false);
+		// The page inside the continuation is told so; the page where it ends is told to skip that part.
+		expect(agent.unitMessages.get("p0002")).toMatch(
+			/Session start[\s\S]*Carry-over from p0001: an entry recorded there continues through this unit and ends in p0003 .*an entry that begins in this unit is recorded here/,
+		);
+		expect(agent.unitMessages.get("p0003")).toMatch(/Carry-over from p0001: .*continues into this unit/);
+		const systemText = JSON.stringify(harness.faux.requests[0].messages.filter((m) => m.role === "system"));
+		expect(systemText).toContain("up to 2 pages ahead");
+		expect(state.units[0]).toMatchObject({ carryOver: carry, carryOverEnd: "p0003" });
+		// The empty middle page goes through the second look like any other empty page.
+		expect(agent.verifyResults.find((result) => result.startsWith("p0002"))).toMatch(/NOT COMMITTED: .*no entries/);
+		expect(state.units[1].status).toBe("committed");
+		expect(state.units[1].issues?.map((issue) => issue.message)).toContain(
+			"committed without entries; confirmed by the agent after a second look",
+		);
+		expect(state.experiment?.settings.lookAhead).toBe(2);
+		expect(sidecar.merged.entries).toHaveLength(2);
+	}, 120_000);
+
+	it("refuses a view two pages ahead by default", async () => {
+		const agent = scriptedAgent({
+			views: ["p0003"],
+			finals: [{ final: true, carry_over: "ends with 'fine paste.'" }],
+		});
+		const { summary, state } = await extractPages(3, agent, {});
+		expect(summary.documents[0]).toMatchObject({ committed: 3, needsReview: 0 });
+		expect(agent.viewResults[0]).toContain("Page p0003 is not available. You can view: p0001, p0002.");
+		expect(agent.unitMessages.get("p0003")).not.toContain("Carry-over");
+		// The default is not recorded, so runs started before the setting existed keep resuming.
+		expect(state.experiment?.settings).not.toHaveProperty("lookAhead");
+	}, 120_000);
+
+	it("rejects a carry_over_end beyond the look-ahead", async () => {
+		const carry = "ends with 'fine paste.'";
+		const agent = scriptedAgent({
+			finals: [
+				{ final: true, carry_over: carry, carry_over_end: "p0004" },
+				{ final: true, carry_over: carry, carry_over_end: " " },
+				{ final: true, carry_over: carry, carry_over_end: "p0002" },
+			],
+		});
+		const { summary, state } = await extractPages(4, agent, { lookAhead: 2 });
+		expect(summary.documents[0]).toMatchObject({ committed: 4, needsReview: 0 });
+		expect(agent.verifyResults[0]).toBe(
+			'p0001: Verify was not run: carry_over_end must be a later unit within reach: p0002, p0003 (not "p0004").',
+		);
+		expect(agent.verifyResults[1]).toBe(
+			'p0001: Verify was not run: carry_over_end must be a later unit within reach: p0002, p0003 (not "").',
+		);
+		expect(state.units[0].carryOverEnd).toBe("p0002");
+	}, 120_000);
+
+	it.each([
+		["without carry_over_end", {}],
+		["with another page id in the note", { carry_over_end: "p0002" }],
+	])(
+		"passes the note to the next page only %s",
+		async (_label, end) => {
+			const agent = scriptedAgent({ finals: [{ final: true, carry_over: "ends before 'see p0003'", ...end }] });
+			const { summary } = await extractPages(3, agent, { lookAhead: 2 });
+			expect(summary.documents[0]).toMatchObject({ committed: 3, needsReview: 0 });
+			expect(agent.unitMessages.get("p0002")).toMatch(
+				/Carry-over from p0001: an entry recorded there continues into this unit/,
+			);
+			expect(agent.unitMessages.get("p0003")).not.toContain("Carry-over");
+		},
+		120_000,
+	);
 });
