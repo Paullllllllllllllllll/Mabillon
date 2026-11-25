@@ -1,5 +1,18 @@
 # Changelog
 
+- **v0.14.2** (25 November 2026) -- A run whose `--model` is missing from pi's
+  cached model catalog asks pi once to update the catalog, waits at most 30
+  seconds, and looks the model up again. pi updated its cache only in
+  `mabillon tui`, so a model published since then was refused, or under a known
+  provider ran as a custom id with the limits and prices of another model. A
+  model in the cache causes no network request, and with `PI_OFFLINE` set pi
+  sends none. The error for a model that stays unknown says whether the catalog
+  was refreshed, and pi's warning about a custom model id now appears in the
+  log. The pi harness moves from 1.5.0 to 1.6.0, again with both packages at
+  the same version. Its catalog adds `openai/gpt-6.2-sol` and
+  `openai/gpt-6.2-astra`, which have no thinking level `off`. Without `--model`
+  and without a default model in pi's settings, a run with only OpenAI
+  credentials now uses GPT-6.2 Sol instead of GPT-6.1 Sol.
 - **v0.14.1** (15 November 2026) -- A `--chrono` run and `--drafts` accept the
   store of ChronoMiner v1.11.0 and later again. Those versions add two indexes
   to the store (schema version 4 of the `chronominer` component), which

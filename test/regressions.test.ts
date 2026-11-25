@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -9,6 +11,7 @@ import {
 	fauxToolCall,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	addEntriesSetup,
@@ -824,6 +827,71 @@ describe("experiment records", () => {
 				},
 			});
 		await expect(run_()).rejects.toThrow(/no bash shell was found.*shellPath/);
+		expect(existsSync(join(root, "out"))).toBe(false);
+	}, 60_000);
+
+	it("refreshes pi's model catalog once for a model the cached catalog lacks", async () => {
+		const { root, text } = recipes();
+		// pi.dev's catalog of openai, served locally; the shell check stops each run after the model is resolved.
+		const requests: string[] = [];
+		const server = createServer((request, response) => {
+			requests.push(request.url ?? "");
+			const catalog = [
+				{
+					id: "gpt-9-test",
+					name: "GPT-9",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:9/v1",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 1, output: 8, cacheRead: 0.1, cacheWrite: 0 },
+					contextWindow: 400_000,
+					maxTokens: 128_000,
+				},
+			];
+			const headers = { "content-type": "application/json", "last-modified": new Date().toUTCString() };
+			if (request.url?.startsWith("/api/models/providers/openai?")) {
+				response.writeHead(200, headers).end(JSON.stringify(catalog));
+			} else response.writeHead(404).end();
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		cleanups.push(
+			() => server.close(),
+			() => vi.unstubAllEnvs(),
+		);
+		vi.stubEnv("PI_OFFLINE", undefined);
+		const agentDir = tempDir("mabillon-agentdir-");
+		writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "sk-test" } }));
+		const modelRuntimeOptions = {
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+			catalogBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+		};
+		const logs: string[] = [];
+		const run_ = (model: string) =>
+			run({
+				mode: "extract",
+				inputs: [text],
+				config: mergeConfig({ model, autoContext: false, out: join(root, "out"), schema, bash: true }),
+				log: (message) => logs.push(message),
+				services: { modelRuntimeOptions, agentDir, settings: {}, findShell: () => ({ available: false }) },
+			});
+		const known = (await ModelRuntime.create(modelRuntimeOptions)).getModels("openai")[0].id;
+		await expect(run_(`openai/${known}`)).rejects.toThrow(/no bash shell was found/);
+		expect(requests).toEqual([]);
+		await expect(run_("openai/gpt-9-test")).rejects.toThrow(/no bash shell was found/);
+		expect(requests).toHaveLength(1);
+		expect(logs.join("\n")).not.toMatch(/custom model id/);
+		// pi checked the catalog moments ago and sends no second request; the custom id stays usable.
+		await expect(run_("openai/gpt-9-none")).rejects.toThrow(/no bash shell was found/);
+		expect(logs.join("\n")).toMatch(
+			/"gpt-9-none" not found for provider "openai"\. Using custom model id; pi's openai model catalog was refreshed\./,
+		);
+		vi.stubEnv("PI_OFFLINE", "1");
+		await expect(run_("nope/model")).rejects.toThrow(
+			/"nope\/model" not found\. Run `mabillon tui` and \/model to see available models; pi's model catalogs were not refreshed because PI_OFFLINE is set\.$/,
+		);
+		expect(requests).toHaveLength(1);
 		expect(existsSync(join(root, "out"))).toBe(false);
 	}, 60_000);
 

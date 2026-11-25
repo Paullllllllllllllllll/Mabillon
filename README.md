@@ -1,4 +1,4 @@
-# Mabillon v0.14.1
+# Mabillon v0.14.2
 
 <img src="assets/logo.svg" alt="Mabillon logo" width="64" align="right">
 
@@ -42,8 +42,9 @@ mabillon tui        # then type /login and pick a provider (e.g. ChatGPT, Claude
 API keys in the usual environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, ...) work as well. Models are named
 `<provider>/<id>`, for example `openai/gpt-6-luna` or `openrouter/qwen/qwen3.8-27b`.
-[docs/providers.md](docs/providers.md) covers model names, OpenRouter data retention
-and provider pinning, and OpenAI service tiers.
+A model missing from pi's cached model catalog makes the run ask pi to update the
+catalog first. [docs/providers.md](docs/providers.md) covers model names and the
+catalog, OpenRouter data retention and provider pinning, and OpenAI service tiers.
 
 ## Usage
 
@@ -230,7 +231,7 @@ npm run build
 The end-to-end tests drive the real pi agent loop with a scripted model and cover the
 unit gate, tool budgets, nudges, compaction, session handoff, PDF rendering, provider
 errors, resume checks, and extraction with grounding and carry-over. Mabillon pins
-`@earendil-works/pi-coding-agent` at 1.5.0. The check of the outputs against the Chrono
+`@earendil-works/pi-coding-agent` at 1.6.0. The check of the outputs against the Chrono
 tools' own code is described in [docs/chrono.md](docs/chrono.md#interop-check).
 
 ## Versioning

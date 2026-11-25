@@ -17,6 +17,17 @@ Models are named `<provider>/<id>`. pi names the ChatGPT subscription login `ope
 for example `openai/gpt-6-luna`. `openai-codex` is a separate legacy provider that
 needs its own login.
 
+pi caches the model catalogs of its providers in `~/.pi/agent/models-store.json` and
+updates them from pi.dev when `mabillon tui` starts. A run looks `--model` up in that
+cache. A model the cache holds causes no network request. For any other model, the
+run asks pi once to update the catalogs (only the provider's when the name gives a
+known provider), waits at most 30 seconds and looks the model up again. pi sends the
+request only for providers with credentials, not within four hours of its last check,
+and not when `PI_OFFLINE` is set. A model that stays unknown stops the run with exit
+code 2, and the message says whether the catalogs were refreshed. An id that a known
+provider's catalog still lacks, such as `openai/<new id>`, runs as a custom model with
+the limits and prices of that provider's default model, and the log says so.
+
 Open-weight models on OpenRouter carry the vendor in their id, for example
 `openrouter/qwen/qwen3.8-27b`, `openrouter/moonshotai/kimi-k3` or
 `openrouter/z-ai/glm-5.3-flash`.

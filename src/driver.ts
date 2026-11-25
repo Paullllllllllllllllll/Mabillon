@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative } from "node:path";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import {
+	type CreateModelRuntimeOptions,
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
@@ -101,7 +102,10 @@ import {
 } from "./util.ts";
 
 export interface RunServices {
+	/** A runtime given here is used as it is; only a runtime the run creates refreshes pi's catalogs for an unknown model. */
 	modelRuntime?: ModelRuntime;
+	/** Options of the runtime the run creates without `modelRuntime` (tests: a temporary agent folder, a local catalog). */
+	modelRuntimeOptions?: CreateModelRuntimeOptions;
 	/** pi agent directory with auth.json, models.json, settings.json. Default: ~/.pi/agent (shared with pi). */
 	agentDir?: string;
 	/** Settings to use instead of the agent directory's settings.json (tests). */
@@ -1579,23 +1583,62 @@ async function processDocument(
 	return result;
 }
 
+/** Longest wait for pi's model catalog refresh when the requested model is not in the cached catalog. */
+const CATALOG_REFRESH_TIMEOUT_MS = 30_000;
+
+/**
+ * Refresh pi's model catalogs (only the provider's, when one is known) and describe the outcome as a clause. pi
+ * decides whether to send the request: not under PI_OFFLINE, not for providers without credentials, and not within
+ * four hours of its last check.
+ */
+async function refreshCatalogs(modelRuntime: ModelRuntime, provider: string | undefined): Promise<string> {
+	const [catalog, was] = provider ? [`pi's ${provider} model catalog`, "was"] : ["pi's model catalogs", "were"];
+	const result = await modelRuntime.refresh({
+		providers: provider ? [provider] : undefined,
+		signal: AbortSignal.timeout(CATALOG_REFRESH_TIMEOUT_MS),
+	});
+	// A token refresh the catalog refresh started outlives the timeout; it must be saved before the run can exit.
+	await modelRuntime.settleCredentialWrites();
+	if (result.aborted) return `${catalog} could not be refreshed within ${CATALOG_REFRESH_TIMEOUT_MS / 1000} s`;
+	if (result.errors.size > 0) {
+		return `${catalog} could not be refreshed (${[...result.errors.values()].map(errorMessage).join("; ")})`;
+	}
+	// pi's own test: any value turns its network requests off.
+	if (process.env.PI_OFFLINE !== undefined) return `${catalog} ${was} not refreshed because PI_OFFLINE is set`;
+	return `${catalog} ${was} refreshed`;
+}
+
 /** Resolve the model once for the whole run (shared pi credentials and models.json). */
 async function resolveModel(
 	config: ChronoConfig,
 	services: RunServices | undefined,
+	log: (message: string) => void,
 ): Promise<{ modelRuntime: ModelRuntime; model: Model<any> | undefined; agentDir: string }> {
 	const agentDir = services?.agentDir ?? getAgentDir();
-	const modelRuntime = services?.modelRuntime ?? (await ModelRuntime.create());
-	if (!config.model) return { modelRuntime, model: undefined, agentDir };
-	const resolved = resolveCliModel({ cliModel: config.model, modelRuntime });
+	const modelRuntime = services?.modelRuntime ?? (await ModelRuntime.create(services?.modelRuntimeOptions));
+	const cliModel = config.model;
+	if (!cliModel) return { modelRuntime, model: undefined, agentDir };
+	let resolved = resolveCliModel({ cliModel, modelRuntime });
+	// pi refreshes its cached catalogs from the network only when asked, as its interactive mode does at the start. A
+	// model published since then is unknown, or for a known provider a custom id with another model's limits.
+	let refresh: string | undefined;
+	const first = resolved.model;
+	if (!services?.modelRuntime && !(first && modelRuntime.getModel(first.provider, first.id))) {
+		refresh = await refreshCatalogs(modelRuntime, first?.provider);
+		resolved = resolveCliModel({ cliModel, modelRuntime });
+	}
+	const withRefresh = (message: string) => (refresh ? `${message.replace(/\.$/, "")}; ${refresh}.` : message);
 	if (resolved.error || !resolved.model) {
 		throw new Error(
-			(resolved.error ?? `Unknown model "${config.model}"`).replace(
-				"Use --list-models",
-				"Run `mabillon tui` and /model",
+			withRefresh(
+				(resolved.error ?? `Unknown model "${cliModel}"`).replace(
+					"Use --list-models",
+					"Run `mabillon tui` and /model",
+				),
 			),
 		);
 	}
+	if (resolved.warning) log(withRefresh(resolved.warning));
 	return { modelRuntime, model: resolved.model, agentDir };
 }
 
@@ -1730,7 +1773,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 		checkToolSet(effectiveTools(config, { mode, inputKind, entries }), { mode, inputKind });
 	}
 	log(`schema ${schema.name}${schema.bundled ? " (bundled)" : ""}; ${documents.length} document(s)`);
-	const { modelRuntime, model, agentDir } = await resolveModel(config, options.services);
+	const { modelRuntime, model, agentDir } = await resolveModel(config, options.services, log);
 	// A service tier is refused for models it cannot reach, rather than silently not sent.
 	if (config.serviceTier) {
 		const auth = model ? await modelRuntime.checkAuth(model.provider) : undefined;
